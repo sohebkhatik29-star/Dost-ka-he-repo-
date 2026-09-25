@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: tg-invite-checker-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHECK_DELAY
+        value: "0.6"
+      - key: MAX_LINKS_PER_BATCH
+        value: "1000"
