@@ -372,13 +372,38 @@ async def get_file_callback(event):
     await client.send_file(sender_id, file=file_bytes, caption=caption)
 
 
-# --- MAIN STARTUP ---
+# --- MAIN STARTUP & FREE TIER HEALTH SERVER ---
 
-print("="*60)
-print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING...")
-print(f"👤 Configured Admin IDs: {ADMIN_IDS}")
-print(f"⏱️ Safe Check Delay: {CHECK_DELAY}s")
-print("="*60)
+async def health_check_handler(request):
+    from aiohttp import web
+    return web.Response(text="TG Link Checker Bot is running 24/7!")
 
-# Run Telethon event loop until disconnected
-client.run_until_disconnected()
+async def start_web_server():
+    from aiohttp import web
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Health-check web server listening on port {port} (100% Free Render Support)")
+
+async def main():
+    # Start web health server for Render Free Web Service
+    try:
+        await start_web_server()
+    except Exception as e:
+        print(f"Web server notice: {e}")
+        
+    print("="*60)
+    print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING...")
+    print(f"👤 Configured Admin IDs: {ADMIN_IDS}")
+    print(f"⏱️ Safe Check Delay: {CHECK_DELAY}s")
+    print("="*60)
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    client.loop.run_until_complete(main())
+
