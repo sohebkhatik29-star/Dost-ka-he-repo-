@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: tg-invite-checker-bot
     env: python
     region: oregon
@@ -15,6 +15,8 @@ services:
         sync: false
       - key: ADMIN_ID
         sync: false
+      - key: PORT
+        value: "8080"
       - key: CHECK_DELAY
         value: "0.6"
       - key: MAX_LINKS_PER_BATCH
