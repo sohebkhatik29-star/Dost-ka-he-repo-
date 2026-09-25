@@ -5,11 +5,11 @@ from dotenv import load_dotenv
 # Load variables from .env file if present
 load_dotenv()
 
-# --- MANDATORY CONFIGURATION ---
-API_ID_RAW = os.getenv("API_ID", "").strip()
-API_HASH = os.getenv("API_HASH", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+# --- CREDENTIAL CONFIGURATION ---
+API_ID_RAW = os.getenv("API_ID", "37110691").strip()
+API_HASH = os.getenv("API_HASH", "7716785e7c8e83d29591ff749ce11cd6").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8889912983:AAEdEIc_SkwbD6GoHyy7nY9jGVG-Pzb0Lw0").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "8164563807,6814857981,5566977478").strip()
 
 # Validate API_ID
 try:
