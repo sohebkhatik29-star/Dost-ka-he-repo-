@@ -3,7 +3,6 @@ import io
 import json
 import asyncio
 import time
-import traceback
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
@@ -98,29 +97,104 @@ async def ensure_user_client():
                 await user_client.connect()
             if await user_client.is_user_authorized():
                 return True
-        except Exception as e:
-            print(f"ensure_user_client error: {e}")
+        except Exception:
             return False
     return False
 
 
-# --- FORCE SUBSCRIBE VERIFICATION (FAIL-SAFE) ---
+# --- LOG CHANNEL SENDER (SAFE RESOLVER) ---
+
+async def send_to_log_channel(msg_text: str):
+    """Safely dispatches log messages to the configured Log Channel."""
+    try:
+        await bot_client.send_message(LOG_CHANNEL_ID, msg_text, link_preview=False)
+    except ValueError:
+        try:
+            entity = await bot_client.get_entity(LOG_CHANNEL_ID)
+            await bot_client.send_message(entity, msg_text, link_preview=False)
+        except Exception as e:
+            print(f"⚠️ Log Channel Notice: {e}. (Ensure bot is ADMIN in {LOG_CHANNEL_ID})")
+    except Exception as e:
+        print(f"⚠️ Log Channel Notice: {e}. (Ensure bot is ADMIN in {LOG_CHANNEL_ID})")
+
+
+async def log_user_start_event(user, is_first_time: bool):
+    """Sends log to log channel on user start."""
+    try:
+        user_id = user.id
+        first_name = getattr(user, 'first_name', None) or "Unknown"
+        last_name = getattr(user, 'last_name', None) or ""
+        full_name = f"{first_name} {last_name}".strip()
+        username = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
+        total_count = len(known_users)
+
+        tag = "#NEW_USER_STARTED" if is_first_time else "#USER_START"
+        log_msg = (
+            f"🚀 **{tag}**\n\n"
+            f"👤 **User:** [{full_name}](tg://user?id={user_id})\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"🔗 **Username:** {username}\n"
+            f"👥 **Total Registered Users:** `{total_count}`\n"
+            f"📅 **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
+        )
+        await send_to_log_channel(log_msg)
+    except Exception as e:
+        print(f"Log Error (User Start): {e}")
+
+
+async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
+    """Sends log to log channel whenever any user checks links."""
+    try:
+        user_id = getattr(user, 'id', 'Unknown')
+        first_name = getattr(user, 'first_name', None) or "Unknown"
+        username = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
+        
+        log_msg = (
+            "🔗 **#LINK_CHECK_LOG**\n\n"
+            f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
+            f"🆔 **User ID:** `{user_id}`\n\n"
+            f"📊 **Statistics:**\n"
+            f"• Total Links Checked: `{total_links}`\n"
+            f"• ✅ Working: `{len(working_links)}`\n"
+            f"• ❌ Expired: `{len(expired_links)}`\n\n"
+        )
+
+        if working_links:
+            log_msg += "✅ **Working Links:**\n"
+            for item in working_links[:15]:
+                log_msg += f"• `{item['url']}`\n"
+            if len(working_links) > 15:
+                log_msg += f"... and `{len(working_links) - 15}` more\n"
+            log_msg += "\n"
+
+        if expired_links:
+            log_msg += "❌ **Expired Links:**\n"
+            for item in expired_links[:8]:
+                log_msg += f"• `{item['url']}`\n"
+            if len(expired_links) > 8:
+                log_msg += f"... and `{len(expired_links) - 8}` more\n"
+
+        await send_to_log_channel(log_msg)
+    except Exception as e:
+        print(f"Log Error (Link Activity): {e}")
+
+
+# --- FORCE SUBSCRIBE VERIFICATION ---
 
 async def get_fsub_invite_link():
-    """Returns a direct join link for the Force Sub channel safely."""
+    """Returns a direct join link for the Force Sub channel."""
     try:
         chat = await bot_client.get_entity(FSUB_CHANNEL_ID)
         if getattr(chat, 'username', None):
             return f"https://t.me/{chat.username}"
-        inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=chat))
+        inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=FSUB_CHANNEL_ID))
         return inv.link
     except Exception:
-        clean_id = str(FSUB_CHANNEL_ID).replace("-100", "").replace("-", "")
-        return f"https://t.me/c/{clean_id}"
+        return f"https://t.me/c/{str(FSUB_CHANNEL_ID).replace('-100', '')}"
 
 
 async def check_fsub_membership(user_id: int) -> bool:
-    """Checks if a user is a member of the Force Sub channel with complete fail-safety."""
+    """Checks if a user is a member of the Force Sub channel."""
     if is_admin(user_id):
         return True
     try:
@@ -134,8 +208,7 @@ async def check_fsub_membership(user_id: int) -> bool:
         err_str = str(e).lower()
         if "user_not_participant" in err_str:
             return False
-        # If channel is not accessible or any server error, fail-open so users aren't blocked
-        print(f"FSub notice (allowed access): {e}")
+        # Fail open if bot is not admin in fsub channel yet
         return True
     return True
 
@@ -158,7 +231,6 @@ async def send_fsub_prompt(event, user_id: int):
         else:
             await event.edit(fsub_text, buttons=buttons)
     except Exception as e:
-        print(f"send_fsub_prompt error: {e}")
         await send_start_view(event, user_id)
 
 
@@ -176,70 +248,7 @@ async def check_fsub_again_callback(event):
         else:
             await event.answer("❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", alert=True)
     except Exception as e:
-        print(f"check_fsub_again error: {e}")
         await send_start_view(event, event.sender_id)
-
-
-# --- LOG CHANNEL DISPATCHER (BACKGROUND FAIL-SAFE) ---
-
-async def log_new_user_start(user):
-    """Sends log when a user starts the bot for the FIRST time."""
-    try:
-        user_id = user.id
-        first_name = user.first_name or "Unknown"
-        last_name = user.last_name or ""
-        full_name = f"{first_name} {last_name}".strip()
-        username = f"@{user.username}" if user.username else "No Username"
-        total_count = len(known_users)
-
-        log_msg = (
-            "🆕 **#NEW_USER_STARTED**\n\n"
-            f"👤 **Name:** [{full_name}](tg://user?id={user_id})\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"🔗 **Username:** {username}\n"
-            f"👥 **Total Bot Users:** `{total_count}`\n"
-            f"📅 **Date:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
-        )
-        await bot_client.send_message(LOG_CHANNEL_ID, log_msg)
-    except Exception as e:
-        print(f"Log Notice (New User): {e}")
-
-
-async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
-    """Sends log to log channel whenever any user checks links."""
-    try:
-        user_id = user.id
-        first_name = user.first_name or "Unknown"
-        username = f"@{user.username}" if user.username else "No Username"
-        
-        log_msg = (
-            "🔗 **#LINK_CHECK_LOG**\n\n"
-            f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
-            f"🆔 **User ID:** `{user_id}`\n\n"
-            f"📊 **Statistics:**\n"
-            f"• Total Links Checked: `{total_links}`\n"
-            f"• ✅ Working: `{len(working_links)}`\n"
-            f"• ❌ Expired: `{len(expired_links)}`\n\n"
-        )
-
-        if working_links:
-            log_msg += "✅ **Working Links:**\n"
-            for item in working_links[:10]:
-                log_msg += f"• `{item['url']}`\n"
-            if len(working_links) > 10:
-                log_msg += f"... and `{len(working_links) - 10}` more\n"
-            log_msg += "\n"
-
-        if expired_links:
-            log_msg += "❌ **Expired Links:**\n"
-            for item in expired_links[:5]:
-                log_msg += f"• `{item['url']}`\n"
-            if len(expired_links) > 5:
-                log_msg += f"... and `{len(expired_links) - 5}` more\n"
-
-        await bot_client.send_message(LOG_CHANNEL_ID, log_msg, link_preview=False)
-    except Exception as e:
-        print(f"Log Notice (Link Activity): {e}")
 
 
 # --- START & MENU SYSTEM ---
@@ -263,7 +272,6 @@ async def send_start_view(target, user_id: int):
         )
         
         buttons = []
-        
         if admin_user and not is_logged_in:
             buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
         
@@ -282,7 +290,7 @@ async def send_start_view(target, user_id: int):
         else:
             await target.edit(welcome_text, buttons=buttons)
     except Exception as e:
-        print(f"send_start_view error: {e}")
+        print(f"Error in send_start_view: {e}")
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/start$'))
@@ -294,23 +302,24 @@ async def start_handler(event: Message):
         if is_banned(sender_id):
             return await event.reply("⛔ You are banned from using this bot.")
 
-        # Check and Log First Time Start
-        if sender_id not in known_users:
+        # Log User Start Event (New user or returning)
+        is_new_user = (sender_id not in known_users)
+        if is_new_user:
             known_users.add(sender_id)
             save_json_set(USERS_FILE, known_users)
-            if sender:
-                asyncio.create_task(log_new_user_start(sender))
 
-        # Check Force Sub safely
+        # Dispatch log in background
+        asyncio.create_task(log_user_start_event(sender, is_new_user))
+
+        # Check Force Sub
         if not await check_fsub_membership(sender_id):
             return await send_fsub_prompt(event, sender_id)
 
         await send_start_view(event, sender_id)
     except Exception as e:
-        print(f"start_handler error: {e}")
-        traceback.print_exc()
+        print(f"Error in start_handler: {e}")
         try:
-            await event.reply("💎 **Telegram Bulk Link Checker Bot is Online!**\n\nSend or forward your links here.")
+            await event.reply("💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\nSend or forward your links here to start checking!")
         except Exception:
             pass
 
@@ -404,7 +413,7 @@ async def status_callback(event):
         f"📦 **Max Links Per Batch:** `{MAX_LINKS_PER_BATCH}`\n"
         f"⏱️ **Check Delay:** `{CHECK_DELAY}s`\n"
     )
-    buttons = [[Button.inline("⬅️ Back to Menu", data=b"back_to_start")]]
+    buttons = [[Button.inline("⬅️ Back to Menu", data=b"back_to_start")]])
     await event.edit(status_text, buttons=buttons)
 
 
@@ -642,80 +651,77 @@ async def process_password_submission(event: Message, sender_id: int, password_r
 
 @bot_client.on(events.NewMessage)
 async def message_handler(event: Message):
-    try:
-        sender_id = event.sender_id
-        if is_banned(sender_id):
-            return
+    sender_id = event.sender_id
+    if is_banned(sender_id):
+        return
 
-        text_content = (event.text or "").strip()
-        if not text_content:
-            return
+    text_content = (event.text or "").strip()
+    if not text_content:
+        return
 
-        # Check admin login state
-        if is_admin(sender_id):
-            state = login_states.get(sender_id)
-            if state:
-                step = state.get('step')
-                if step == 'awaiting_phone':
-                    await process_phone_submission(event, sender_id, text_content)
+    # Check admin login state
+    if is_admin(sender_id):
+        state = login_states.get(sender_id)
+        if state:
+            step = state.get('step')
+            if step == 'awaiting_phone':
+                await process_phone_submission(event, sender_id, text_content)
+                return
+            elif step == 'awaiting_otp':
+                otp_cleaned = text_content.replace('/otp', '').strip()
+                if otp_cleaned.isdigit() or len(otp_cleaned) in (5, 6):
+                    await process_otp_submission(event, sender_id, otp_cleaned)
                     return
-                elif step == 'awaiting_otp':
-                    otp_cleaned = text_content.replace('/otp', '').strip()
-                    if otp_cleaned.isdigit() or len(otp_cleaned) in (5, 6):
-                        await process_otp_submission(event, sender_id, otp_cleaned)
-                        return
-                elif step == 'awaiting_password':
-                    pwd_cleaned = text_content.replace('/password', '').strip()
-                    await process_password_submission(event, sender_id, pwd_cleaned)
-                    return
-
-        # Handle document upload
-        if event.file and event.file.name and event.file.name.endswith('.txt'):
-            try:
-                file_bytes = await event.download_media(bytes)
-                text_content = file_bytes.decode('utf-8', errors='ignore')
-            except Exception as e:
-                await event.reply(f"⚠️ Could not read document: {str(e)}")
+            elif step == 'awaiting_password':
+                pwd_cleaned = text_content.replace('/password', '').strip()
+                await process_password_submission(event, sender_id, pwd_cleaned)
                 return
 
-        # Ignore commands
-        if text_content.startswith('/'):
+    # Handle document upload
+    if event.file and event.file.name and event.file.name.endswith('.txt'):
+        try:
+            file_bytes = await event.download_media(bytes)
+            text_content = file_bytes.decode('utf-8', errors='ignore')
+        except Exception as e:
+            await event.reply(f"⚠️ Could not read document: {str(e)}")
             return
 
-        # Check Force Sub
-        if not await check_fsub_membership(sender_id):
-            return await send_fsub_prompt(event, sender_id)
+    # Ignore commands
+    if text_content.startswith('/'):
+        return
 
-        # Extract unique links
-        links = extract_telegram_links(text_content)
-        if not links:
-            return
+    # Check Force Sub
+    if not await check_fsub_membership(sender_id):
+        return await send_fsub_prompt(event, sender_id)
 
-        if len(links) > MAX_LINKS_PER_BATCH:
-            await event.reply(
-                f"⚠️ **Limit Exceeded:** You sent `{len(links)}` links.\n"
-                f"Maximum allowed per batch is `{MAX_LINKS_PER_BATCH}` links. Please split your list."
-            )
-            return
+    # Extract unique links
+    links = extract_telegram_links(text_content)
+    if not links:
+        return
 
-        user_sessions[sender_id] = {
-            'pending_links': links,
-            'results': None,
-            'started_at': None
-        }
-
-        buttons = [
-            [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
-            [Button.inline("❌ Cancel", data=b"cancel_check")]
-        ]
+    if len(links) > MAX_LINKS_PER_BATCH:
         await event.reply(
-            f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
-            "Duplicate links have been automatically removed.\n"
-            "Click **Start Checking** to begin verification.",
-            buttons=buttons
+            f"⚠️ **Limit Exceeded:** You sent `{len(links)}` links.\n"
+            f"Maximum allowed per batch is `{MAX_LINKS_PER_BATCH}` links. Please split your list."
         )
-    except Exception as e:
-        print(f"message_handler error: {e}")
+        return
+
+    user_sessions[sender_id] = {
+        'pending_links': links,
+        'results': None,
+        'started_at': None
+    }
+
+    buttons = [
+        [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
+        [Button.inline("❌ Cancel", data=b"cancel_check")]
+    ]
+    await event.reply(
+        f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
+        "Duplicate links have been automatically removed.\n"
+        "Click **Start Checking** to begin verification.",
+        buttons=buttons
+    )
 
 
 # --- CHECKING & PROGRESS WORKFLOW ---
@@ -729,124 +735,118 @@ async def cancel_callback(event):
 
 @bot_client.on(events.CallbackQuery(data=b"start_check"))
 async def start_check_callback(event):
-    try:
-        sender_id = event.sender_id
-        if is_banned(sender_id):
-            return await event.answer("You are banned from using this bot.", alert=True)
+    sender_id = event.sender_id
+    if is_banned(sender_id):
+        return await event.answer("You are banned from using this bot.", alert=True)
 
-        if not await check_fsub_membership(sender_id):
-            return await send_fsub_prompt(event, sender_id)
+    if not await check_fsub_membership(sender_id):
+        return await send_fsub_prompt(event, sender_id)
 
-        session = user_sessions.get(sender_id)
-        if not session or not session.get('pending_links'):
-            return await event.edit("⚠️ No links found in queue. Please send your links again.")
+    session = user_sessions.get(sender_id)
+    if not session or not session.get('pending_links'):
+        return await event.edit("⚠️ No links found in queue. Please send your links again.")
 
-        links = session['pending_links']
-        total_count = len(links)
+    links = session['pending_links']
+    total_count = len(links)
+    
+    # Check if MTProto engine is connected
+    is_user_auth = await ensure_user_client()
+    has_private_links = any(parse_link(u)[0] == 'invite' for u in links)
+
+    if has_private_links and not is_user_auth:
+        if is_admin(sender_id):
+            buttons = [
+                [Button.inline("🔑 Connect Engine Now (1-Click)", data=b"start_login_flow")],
+                [Button.inline("❌ Cancel", data=b"cancel_check")]
+            ]
+            return await event.edit(
+                "⚠️ **Admin Notice: MTProto Engine Disconnected**\n\n"
+                "Server restart hone par Telegram engine disconnect ho gaya hai.\n\n"
+                "👉 **Neeche button dabakar 5 second me connect karein:**",
+                buttons=buttons
+            )
+        else:
+            return await event.edit(
+                "⚠️ **Bot Engine Initializing...**\n\n"
+                "Bot is currently establishing MTProto connection. Please try again in 1 minute!"
+            )
+
+    active_client = user_client if is_user_auth else bot_client
+
+    await event.edit(
+        f"🔄 **Starting Verification...**\n\n"
+        f"📊 Total Links: `{total_count}`\n"
+        f"⏳ Validating links safely..."
+    )
+
+    working_list = []
+    expired_list = []
+    error_list = []
+    last_update_time = time.time()
+    
+    for idx, url in enumerate(links, start=1):
+        res = await check_single_link(active_client, url)
         
-        # Check if MTProto engine is connected
-        is_user_auth = await ensure_user_client()
-        
-        # Check if batch contains private links
-        has_private_links = any(parse_link(u)[0] == 'invite' for u in links)
+        if res['status'] == 'working':
+            working_list.append(res)
+        elif res['status'] == 'expired':
+            expired_list.append(res)
+        else:
+            error_list.append(res)
 
-        if has_private_links and not is_user_auth:
-            if is_admin(sender_id):
-                buttons = [
-                    [Button.inline("🔑 Connect Engine Now (1-Click)", data=b"start_login_flow")],
-                    [Button.inline("❌ Cancel", data=b"cancel_check")]
-                ]
-                return await event.edit(
-                    "⚠️ **Admin Notice: MTProto Engine Disconnected**\n\n"
-                    "Server restart hone par Telegram engine disconnect ho gaya hai.\n\n"
-                    "👉 **Neeche button dabakar 5 second me connect karein:**",
-                    buttons=buttons
+        current_time = time.time()
+        is_last = (idx == total_count)
+        if is_last or (current_time - last_update_time >= 2.5) or (idx % 4 == 0):
+            try:
+                progress_text = (
+                    f"🔍 **Checking Links in Progress...**\n\n"
+                    f"**Progress:** `{idx} / {total_count}` (`{int((idx/total_count)*100)}%`)\n\n"
+                    f"✅ **Working:** `{len(working_list)}`\n"
+                    f"❌ **Expired / Invalid:** `{len(expired_list)}`\n"
+                    f"⚠️ **Could Not Check:** `{len(error_list)}`\n\n"
+                    f"⏳ *Please wait while MTProto validates links safely...*"
                 )
-            else:
-                return await event.edit(
-                    "⚠️ **Bot Engine Initializing...**\n\n"
-                    "Bot is currently establishing connection. Please try again in 1 minute!"
-                )
+                await event.edit(progress_text)
+                last_update_time = current_time
+            except Exception:
+                pass
 
-        active_client = user_client if is_user_auth else bot_client
+        await asyncio.sleep(CHECK_DELAY)
 
-        await event.edit(
-            f"🔄 **Starting Verification...**\n\n"
-            f"📊 Total Links: `{total_count}`\n"
-            f"⏳ Validating links safely..."
-        )
+    session['results'] = {
+        'total': total_count,
+        'working': working_list,
+        'expired': expired_list,
+        'error': error_list
+    }
 
-        working_list = []
-        expired_list = []
-        error_list = []
-        last_update_time = time.time()
-        
-        for idx, url in enumerate(links, start=1):
-            res = await check_single_link(active_client, url)
-            
-            if res['status'] == 'working':
-                working_list.append(res)
-            elif res['status'] == 'expired':
-                expired_list.append(res)
-            else:
-                error_list.append(res)
+    # Dispatch Activity Log to Log Channel
+    sender_obj = await event.get_sender()
+    asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
 
-            current_time = time.time()
-            is_last = (idx == total_count)
-            if is_last or (current_time - last_update_time >= 2.5) or (idx % 4 == 0):
-                try:
-                    progress_text = (
-                        f"🔍 **Checking Links in Progress...**\n\n"
-                        f"**Progress:** `{idx} / {total_count}` (`{int((idx/total_count)*100)}%`)\n\n"
-                        f"✅ **Working:** `{len(working_list)}`\n"
-                        f"❌ **Expired / Invalid:** `{len(expired_list)}`\n"
-                        f"⚠️ **Could Not Check:** `{len(error_list)}`\n\n"
-                        f"⏳ *Please wait while MTProto validates links safely...*"
-                    )
-                    await event.edit(progress_text)
-                    last_update_time = current_time
-                except Exception:
-                    pass
+    working_pct = (len(working_list) / total_count * 100) if total_count > 0 else 0
+    expired_pct = (len(expired_list) / total_count * 100) if total_count > 0 else 0
 
-            await asyncio.sleep(CHECK_DELAY)
+    summary_text = (
+        "🏁 **CHECK COMPLETE**\n\n"
+        "📊 **Statistics:**\n"
+        f"• **Total Links:** `{total_count}`\n"
+        f"• ✅ **Working Links:** `{len(working_list)}` ({working_pct:.1f}%)\n"
+        f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n"
+    )
+    
+    if error_list:
+        summary_text += f"• ⚠️ **Could Not Check:** `{len(error_list)}`\n"
 
-        session['results'] = {
-            'total': total_count,
-            'working': working_list,
-            'expired': expired_list,
-            'error': error_list
-        }
+    summary_text += "\n**Choose how to receive working links:**"
 
-        # Dispatch Activity Log to Log Channel
-        sender_obj = await event.get_sender()
-        if sender_obj:
-            asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
+    result_buttons = [
+        [Button.inline(f"📋 Get as Text ({len(working_list)})", data=b"get_as_text")],
+        [Button.inline("📁 Get as File (.txt)", data=b"get_as_file")],
+        [Button.inline("🔄 Check New Links", data=b"back_to_start")]
+    ]
 
-        working_pct = (len(working_list) / total_count * 100) if total_count > 0 else 0
-        expired_pct = (len(expired_list) / total_count * 100) if total_count > 0 else 0
-
-        summary_text = (
-            "🏁 **CHECK COMPLETE**\n\n"
-            "📊 **Statistics:**\n"
-            f"• **Total Links:** `{total_count}`\n"
-            f"• ✅ **Working Links:** `{len(working_list)}` ({working_pct:.1f}%)\n"
-            f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n"
-        )
-        
-        if error_list:
-            summary_text += f"• ⚠️ **Could Not Check:** `{len(error_list)}`\n"
-
-        summary_text += "\n**Choose how to receive working links:**"
-
-        result_buttons = [
-            [Button.inline(f"📋 Get as Text ({len(working_list)})", data=b"get_as_text")],
-            [Button.inline("📁 Get as File (.txt)", data=b"get_as_file")],
-            [Button.inline("🔄 Check New Links", data=b"back_to_start")]
-        ]
-
-        await event.edit(summary_text, buttons=result_buttons)
-    except Exception as e:
-        print(f"start_check_callback error: {e}")
+    await event.edit(summary_text, buttons=result_buttons)
 
 
 # --- RESULT DELIVERY HANDLERS ---
@@ -936,22 +936,22 @@ async def health_check_handler(request):
     return web.Response(text="TG Link Checker Bot is running 24/7!")
 
 async def start_web_server():
-    try:
-        from aiohttp import web
-        port = int(os.environ.get("PORT", 8080))
-        app = web.Application()
-        app.router.add_get("/", health_check_handler)
-        app.router.add_get("/health", health_check_handler)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        print(f"🌐 Health-check web server listening on port {port} (100% Free Render Support)")
-    except Exception as e:
-        print(f"Web server notice: {e}")
+    from aiohttp import web
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Health-check web server listening on port {port} (100% Free Render Support)")
 
 async def main():
-    await start_web_server()
+    try:
+        await start_web_server()
+    except Exception as e:
+        print(f"Web server notice: {e}")
         
     print("="*60)
     print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING (PUBLIC MODE)...")
@@ -959,6 +959,17 @@ async def main():
     print(f"📢 Log Channel: {LOG_CHANNEL_ID}")
     print(f"🔒 Force Sub Channel: {FSUB_CHANNEL_ID}")
     print("="*60)
+
+    # Send Boot/Online log directly to Log Channel
+    startup_log = (
+        "🟢 **#BOT_STARTED / ONLINE**\n\n"
+        f"🤖 **Bot:** {BOT_USERNAME}\n"
+        f"👥 **Total Registered Users:** `{len(known_users)}`\n"
+        f"📅 **Boot Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n"
+        "🚀 Bot is active and running 24/7!"
+    )
+    asyncio.create_task(send_to_log_channel(startup_log))
+
     await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
