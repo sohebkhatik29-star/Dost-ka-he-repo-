@@ -6,7 +6,6 @@ import time
 import re
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.tl.custom import Message
 from telethon.tl import functions, types
 
 from config import (
@@ -90,13 +89,13 @@ def is_banned(user_id: int) -> bool:
 
 
 async def ensure_user_client():
-    """Checks if the user MTProto client is connected and authorized."""
+    """Checks if the user MTProto client is connected and authorized without hanging."""
     global user_client
     if user_client:
         try:
             if not user_client.is_connected():
-                await user_client.connect()
-            if await user_client.is_user_authorized():
+                await asyncio.wait_for(user_client.connect(), timeout=2.0)
+            if await asyncio.wait_for(user_client.is_user_authorized(), timeout=2.0):
                 return True
         except Exception:
             return False
@@ -186,7 +185,7 @@ async def log_link_check_activity(user, total_links: int, working_links: list, e
 async def get_fsub_invite_link():
     """Returns a direct join link for the Force Sub channel."""
     try:
-        chat = await bot_client.get_entity(FSUB_CHANNEL_ID)
+        chat = await asyncio.wait_for(bot_client.get_entity(FSUB_CHANNEL_ID), timeout=2.0)
         if getattr(chat, 'username', None):
             return f"https://t.me/{chat.username}"
         inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=chat))
@@ -196,45 +195,41 @@ async def get_fsub_invite_link():
 
 
 async def check_fsub_membership(user_id: int) -> bool:
-    """Checks if a user is a member of the Force Sub channel."""
+    """Checks if a user is a member of the Force Sub channel safely."""
     if is_admin(user_id):
         return True
     try:
-        chat = await bot_client.get_entity(FSUB_CHANNEL_ID)
-        participant = await bot_client(functions.channels.GetParticipantRequest(
+        chat = await asyncio.wait_for(bot_client.get_entity(FSUB_CHANNEL_ID), timeout=2.0)
+        participant = await asyncio.wait_for(bot_client(functions.channels.GetParticipantRequest(
             channel=chat,
             participant=user_id
-        ))
+        )), timeout=2.0)
         if participant:
             return True
     except Exception as e:
         err_str = str(e).lower()
         if "user_not_participant" in err_str:
             return False
-        # If bot is not in channel or peer error, don't block user
         return True
     return True
 
 
 async def send_fsub_prompt(event, user_id: int):
     """Prompts the user to join the Force Sub channel before using the bot."""
-    try:
-        channel_link = await get_fsub_invite_link()
-        fsub_text = (
-            "🔒 **Access Restricted: Join Channel First**\n\n"
-            "Bot use karne ke liye pehle hamare official channel ko join karein.\n\n"
-            "👉 **Neeche button par click karke channel join karein**, phir **'🔄 Try Again'** dabayein."
-        )
-        buttons = [
-            [Button.url("📢 Join Channel", channel_link)],
-            [Button.inline("🔄 Try Again", data=b"check_fsub_again")]
-        ]
-        if isinstance(event, Message):
-            await event.reply(fsub_text, buttons=buttons)
-        else:
-            await event.edit(fsub_text, buttons=buttons)
-    except Exception:
-        await send_start_view(event, user_id)
+    channel_link = await get_fsub_invite_link()
+    fsub_text = (
+        "🔒 **Access Restricted: Join Channel First**\n\n"
+        "Bot use karne ke liye pehle hamare official channel ko join karein.\n\n"
+        "👉 **Neeche button par click karke channel join karein**, phir **'🔄 Try Again'** dabayein."
+    )
+    buttons = [
+        [Button.url("📢 Join Channel", channel_link)],
+        [Button.inline("🔄 Try Again", data=b"check_fsub_again")]
+    ]
+    if isinstance(event, events.CallbackQuery.Event):
+        await event.edit(fsub_text, buttons=buttons)
+    else:
+        await event.respond(fsub_text, buttons=buttons)
 
 
 @bot_client.on(events.CallbackQuery(data=b"check_fsub_again"))
@@ -258,74 +253,68 @@ async def check_fsub_again_callback(event):
 # --- START & MENU SYSTEM ---
 
 async def send_start_view(target, user_id: int):
+    admin_user = is_admin(user_id)
+    is_logged_in = await ensure_user_client()
+
+    welcome_text = (
+        "💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\n"
+        "A smart and lightning-fast bot to verify Telegram invite links and filter active ones.\n\n"
+        "⚡ **Features:**\n"
+        "• Bulk link extraction from messy text/chats\n"
+        "• Deep MTProto validation (Active, Expired, Revoked)\n"
+        "• Duplicate link removal automatically\n"
+        "• Live progress tracking\n"
+        "• Export active links as Text or .TXT File\n\n"
+        "📥 **How to use:**\n"
+        "Simply send or forward any message containing Telegram links here!"
+    )
+    
+    buttons = []
+    
+    if admin_user and not is_logged_in:
+        buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
+    
+    buttons.append([
+        Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
+        Button.inline("📖 About Bot", data=b"menu_about")
+    ])
+    
+    row2 = [Button.inline("⚙️ Bot Status", data=b"menu_status")]
+    if admin_user:
+        row2.append(Button.inline("🛡️ Admin Panel", data=b"menu_admin_stats"))
+    buttons.append(row2)
+
     try:
-        admin_user = is_admin(user_id)
-        is_logged_in = await ensure_user_client()
-
-        welcome_text = (
-            "💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\n"
-            "A smart and lightning-fast bot to verify Telegram invite links and filter active ones.\n\n"
-            "⚡ **Features:**\n"
-            "• Bulk link extraction from messy text/chats\n"
-            "• Deep MTProto validation (Active, Expired, Revoked)\n"
-            "• Duplicate link removal automatically\n"
-            "• Live progress tracking\n"
-            "• Export active links as Text or .TXT File\n\n"
-            "📥 **How to use:**\n"
-            "Simply send or forward any message containing Telegram links here!"
-        )
-        
-        buttons = []
-        
-        if admin_user and not is_logged_in:
-            buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
-        
-        buttons.append([
-            Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
-            Button.inline("📖 About Bot", data=b"menu_about")
-        ])
-        
-        row2 = [Button.inline("⚙️ Bot Status", data=b"menu_status")]
-        if admin_user:
-            row2.append(Button.inline("🛡️ Admin Panel", data=b"menu_admin_stats"))
-        buttons.append(row2)
-
-        if isinstance(target, Message):
-            await target.reply(welcome_text, buttons=buttons)
-        else:
+        if isinstance(target, events.CallbackQuery.Event):
             await target.edit(welcome_text, buttons=buttons)
+        else:
+            await target.respond(welcome_text, buttons=buttons)
     except Exception as e:
-        print(f"Error in send_start_view: {e}")
+        print(f"Error in send_start_view send: {e}")
+        await bot_client.send_message(user_id, welcome_text, buttons=buttons)
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/start(?:\s+.*)?$'))
-async def start_handler(event: Message):
-    try:
-        sender = await event.get_sender()
-        sender_id = event.sender_id
+async def start_handler(event):
+    sender = await event.get_sender()
+    sender_id = event.sender_id
 
-        if is_banned(sender_id):
-            return await event.reply("⛔ You are banned from using this bot.")
+    if is_banned(sender_id):
+        return await event.respond("⛔ You are banned from using this bot.")
 
-        # ONLY send log when user starts for the VERY FIRST TIME
-        if sender_id not in known_users:
-            known_users.add(sender_id)
-            save_json_set(USERS_FILE, known_users)
-            if sender:
-                asyncio.create_task(log_new_user_start(sender))
+    # ONLY send log when user starts for the VERY FIRST TIME
+    if sender_id not in known_users:
+        known_users.add(sender_id)
+        save_json_set(USERS_FILE, known_users)
+        if sender:
+            asyncio.create_task(log_new_user_start(sender))
 
-        # Check Force Sub
-        is_member = await check_fsub_membership(sender_id)
-        if not is_member:
-            return await send_fsub_prompt(event, sender_id)
+    # Check Force Sub
+    is_member = await check_fsub_membership(sender_id)
+    if not is_member:
+        return await send_fsub_prompt(event, sender_id)
 
-        await send_start_view(event, sender_id)
-    except Exception as e:
-        print(f"Error in start_handler: {e}")
-        try:
-            await send_start_view(event, event.sender_id)
-        except Exception:
-            pass
+    await send_start_view(event, sender_id)
 
 
 @bot_client.on(events.CallbackQuery(data=b"back_to_start"))
@@ -334,7 +323,7 @@ async def back_callback(event):
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/help(?:\s+.*)?$'))
-async def help_cmd_handler(event: Message):
+async def help_cmd_handler(event):
     if is_banned(event.sender_id):
         return
     await send_help_view(event)
@@ -363,14 +352,14 @@ async def send_help_view(target):
         f"⏱️ **Safe Delay:** **{CHECK_DELAY}s** per link to prevent rate-limits."
     )
     buttons = [[Button.inline("⬅️ Back to Menu", data=b"back_to_start")]]
-    if isinstance(target, Message):
-        await target.reply(help_text, buttons=buttons)
-    else:
+    if isinstance(target, events.CallbackQuery.Event):
         await target.edit(help_text, buttons=buttons)
+    else:
+        await target.respond(help_text, buttons=buttons)
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/about(?:\s+.*)?$'))
-async def about_cmd_handler(event: Message):
+async def about_cmd_handler(event):
     if is_banned(event.sender_id):
         return
     await send_about_view(event)
@@ -398,10 +387,10 @@ async def send_about_view(target):
         ],
         [Button.inline("⬅️ Back to Menu", data=b"back_to_start")]
     ]
-    if isinstance(target, Message):
-        await target.reply(about_text, buttons=buttons)
-    else:
+    if isinstance(target, events.CallbackQuery.Event):
         await target.edit(about_text, buttons=buttons)
+    else:
+        await target.respond(about_text, buttons=buttons)
 
 
 @bot_client.on(events.CallbackQuery(data=b"menu_status"))
@@ -451,53 +440,53 @@ async def admin_stats_callback(event):
 # --- ADMIN BAN & UNBAN COMMANDS ---
 
 @bot_client.on(events.NewMessage(pattern=r'^/ban(?:\s+(\d+))?$'))
-async def ban_user_handler(event: Message):
+async def ban_user_handler(event):
     if not is_admin(event.sender_id):
         return
 
     target_id_str = event.pattern_match.group(1)
     if not target_id_str:
-        return await event.reply("⚠️ **Usage:** `/ban <user_id>`\nExample: `/ban 123456789`")
+        return await event.respond("⚠️ **Usage:** `/ban <user_id>`\nExample: `/ban 123456789`")
 
     target_id = int(target_id_str)
     if is_admin(target_id):
-        return await event.reply("❌ You cannot ban an Admin/Owner!")
+        return await event.respond("❌ You cannot ban an Admin/Owner!")
 
     banned_users.add(target_id)
     save_json_set(BANNED_FILE, banned_users)
-    await event.reply(f"🚫 **User Banned:** `{target_id}` has been banned from using this bot.")
+    await event.respond(f"🚫 **User Banned:** `{target_id}` has been banned from using this bot.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/unban(?:\s+(\d+))?$'))
-async def unban_user_handler(event: Message):
+async def unban_user_handler(event):
     if not is_admin(event.sender_id):
         return
 
     target_id_str = event.pattern_match.group(1)
     if not target_id_str:
-        return await event.reply("⚠️ **Usage:** `/unban <user_id>`\nExample: `/unban 123456789`")
+        return await event.respond("⚠️ **Usage:** `/unban <user_id>`\nExample: `/unban 123456789`")
 
     target_id = int(target_id_str)
     if target_id in banned_users:
         banned_users.remove(target_id)
         save_json_set(BANNED_FILE, banned_users)
-        await event.reply(f"✅ **User Unbanned:** `{target_id}` has been unbanned.")
+        await event.respond(f"✅ **User Unbanned:** `{target_id}` has been unbanned.")
     else:
-        await event.reply(f"ℹ️ User `{target_id}` is not in the banned list.")
+        await event.respond(f"ℹ️ User `{target_id}` is not in the banned list.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/banned(?:\s+.*)?$'))
-async def list_banned_handler(event: Message):
+async def list_banned_handler(event):
     if not is_admin(event.sender_id):
         return
 
     if not banned_users:
-        return await event.reply("✅ No users are currently banned.")
+        return await event.respond("✅ No users are currently banned.")
 
     banned_list_text = "⛔ **Banned Users List:**\n\n"
     for uid in banned_users:
         banned_list_text += f"• `{uid}`\n"
-    await event.reply(banned_list_text)
+    await event.respond(banned_list_text)
 
 
 # --- ADMIN LOGIN FLOW ---
@@ -528,7 +517,7 @@ async def cancel_login_callback(event):
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/login(?:\s+(.+))?$'))
-async def login_cmd_handler(event: Message):
+async def login_cmd_handler(event):
     sender_id = event.sender_id
     if not is_admin(sender_id):
         return
@@ -536,12 +525,12 @@ async def login_cmd_handler(event: Message):
     args = event.pattern_match.group(1)
     if not args:
         login_states[sender_id] = {'step': 'awaiting_phone'}
-        return await event.reply("📱 **Please enter your phone number with country code:**\nExample: `+919876543210`")
+        return await event.respond("📱 **Please enter your phone number with country code:**\nExample: `+919876543210`")
 
     await process_phone_submission(event, sender_id, args.strip())
 
 
-async def process_phone_submission(event: Message, sender_id: int, phone_raw: str):
+async def process_phone_submission(event, sender_id: int, phone_raw: str):
     global user_client
     if not is_admin(sender_id):
         return
@@ -552,7 +541,7 @@ async def process_phone_submission(event: Message, sender_id: int, phone_raw: st
     elif not phone.startswith("+"):
         phone = "+" + phone
 
-    await event.reply(f"⏳ Sending Telegram verification code to `{phone}`...")
+    await event.respond(f"⏳ Sending Telegram verification code to `{phone}`...")
 
     try:
         new_client = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -566,17 +555,17 @@ async def process_phone_submission(event: Message, sender_id: int, phone_raw: st
             'client': new_client
         }
 
-        await event.reply(
+        await event.respond(
             f"📩 **Telegram OTP Sent!**\n\n"
             f"Apne Telegram app me official Telegram notification check karein aur **OTP code reply karein**:\n\n"
             f"Example: `12345`"
         )
     except Exception as e:
         login_states.pop(sender_id, None)
-        await event.reply(f"❌ Failed to request code: `{str(e)}`\nPlease verify your phone number format (e.g. `+919876543210`).")
+        await event.respond(f"❌ Failed to request code: `{str(e)}`\nPlease verify your phone number format (e.g. `+919876543210`).")
 
 
-async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
+async def process_otp_submission(event, sender_id: int, otp_raw: str):
     global user_client, user_session_str
     if not is_admin(sender_id):
         return False
@@ -601,7 +590,7 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
         except Exception:
             pass
 
-        await event.reply(
+        await event.respond(
             "🎉 **SUCCESS: Engine Connected!**\n\n"
             "✅ Private invite link checking is now **100% Active for ALL users**.\n\n"
             "🚀 Koi bhi user ab links bhej kar direct check kar sakta hai!"
@@ -612,14 +601,14 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
         error_msg = str(e)
         if "password" in error_msg.lower() or "2fa" in error_msg.lower():
             state['step'] = 'awaiting_password'
-            await event.reply("🔒 **Two-Step Verification (2FA) Enabled!**\n\nApna 2FA Password yahan reply karein:")
+            await event.respond("🔒 **Two-Step Verification (2FA) Enabled!**\n\nApna 2FA Password yahan reply karein:")
             return True
         else:
-            await event.reply(f"❌ Invalid OTP or Sign-in failed: `{error_msg}`\nSend OTP again or send `/login` to restart.")
+            await event.respond(f"❌ Invalid OTP or Sign-in failed: `{error_msg}`\nSend OTP again or send `/login` to restart.")
             return True
 
 
-async def process_password_submission(event: Message, sender_id: int, password_raw: str):
+async def process_password_submission(event, sender_id: int, password_raw: str):
     global user_client, user_session_str
     if not is_admin(sender_id):
         return False
@@ -644,17 +633,17 @@ async def process_password_submission(event: Message, sender_id: int, password_r
         except Exception:
             pass
 
-        await event.reply("🎉 **SUCCESS: 2FA Login Completed!**\n\n✅ Engine is now 100% active for all users.")
+        await event.respond("🎉 **SUCCESS: 2FA Login Completed!**\n\n✅ Engine is now 100% active for all users.")
         return True
     except Exception as e:
-        await event.reply(f"❌ Incorrect 2FA Password: `{str(e)}`\nTry again:")
+        await event.respond(f"❌ Incorrect 2FA Password: `{str(e)}`\nTry again:")
         return True
 
 
 # --- MESSAGE & LINK RECEIVER HANDLER ---
 
 @bot_client.on(events.NewMessage)
-async def message_handler(event: Message):
+async def message_handler(event):
     sender_id = event.sender_id
     if is_banned(sender_id):
         return
@@ -691,7 +680,7 @@ async def message_handler(event: Message):
             file_bytes = await event.download_media(bytes)
             text_content = file_bytes.decode('utf-8', errors='ignore')
         except Exception as e:
-            await event.reply(f"⚠️ Could not read document: {str(e)}")
+            await event.respond(f"⚠️ Could not read document: {str(e)}")
             return
 
     # Check Force Sub
@@ -704,7 +693,7 @@ async def message_handler(event: Message):
         return
 
     if len(links) > MAX_LINKS_PER_BATCH:
-        await event.reply(
+        await event.respond(
             f"⚠️ **Limit Exceeded:** You sent `{len(links)}` links.\n"
             f"Maximum allowed per batch is `{MAX_LINKS_PER_BATCH}` links. Please split your list."
         )
@@ -720,7 +709,7 @@ async def message_handler(event: Message):
         [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
         [Button.inline("❌ Cancel", data=b"cancel_check")]
     ]
-    await event.reply(
+    await event.respond(
         f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
         "Duplicate links have been automatically removed.\n"
         "Click **Start Checking** to begin verification.",
