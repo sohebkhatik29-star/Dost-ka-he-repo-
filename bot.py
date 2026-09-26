@@ -413,7 +413,7 @@ async def status_callback(event):
         f"📦 **Max Links Per Batch:** `{MAX_LINKS_PER_BATCH}`\n"
         f"⏱️ **Check Delay:** `{CHECK_DELAY}s`\n"
     )
-    buttons = [[Button.inline("⬅️ Back to Menu", data=b"back_to_start")]])
+    buttons = [[Button.inline("⬅️ Back to Menu", data=b"back_to_start")]]
     await event.edit(status_text, buttons=buttons)
 
 
