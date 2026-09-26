@@ -556,9 +556,12 @@ async def process_phone_submission(event, sender_id: int, phone_raw: str):
         }
 
         await event.respond(
-            f"📩 **Telegram OTP Sent!**\n\n"
-            f"Apne Telegram app me official Telegram notification check karein aur **OTP code reply karein**:\n\n"
-            f"Example: `12345`"
+            "📩 **Telegram OTP Sent to Telegram App!**\n\n"
+            "⚠️ **IMPORTANT (Telegram Security Rule):**\n"
+            "Telegram chat me direct continuous 5-digit number daalne par code expire ho jata hai!\n\n"
+            "👉 **Isliye OTP ko SPACES ya DASHES ke sath reply karein:**\n"
+            "Example: `1 2 3 4 5` ya `1-2-3-4-5`\n\n"
+            "*(Space ya Dash zaroor daalein taaki Telegram use expire na kare!)*"
         )
     except Exception as e:
         login_states.pop(sender_id, None)
@@ -574,7 +577,12 @@ async def process_otp_submission(event, sender_id: int, otp_raw: str):
     if not state or state.get('step') != 'awaiting_otp':
         return False
 
-    otp_code = otp_raw.strip().replace(" ", "")
+    # Extract all digits, supporting '1 2 3 4 5', '1-2-3-4-5', etc.
+    otp_code = "".join(c for c in otp_raw if c.isdigit())
+    if not otp_code:
+        await event.respond("⚠️ Please enter valid digits. Example: `1 2 3 4 5`")
+        return True
+
     client_inst = state['client']
 
     try:
@@ -604,7 +612,10 @@ async def process_otp_submission(event, sender_id: int, otp_raw: str):
             await event.respond("🔒 **Two-Step Verification (2FA) Enabled!**\n\nApna 2FA Password yahan reply karein:")
             return True
         else:
-            await event.respond(f"❌ Invalid OTP or Sign-in failed: `{error_msg}`\nSend OTP again or send `/login` to restart.")
+            await event.respond(
+                f"❌ Login failed: `{error_msg}`\n\n"
+                "💡 **Tip:** Agar code expire ho gaya ho, to dobara `/login` karke new code lein aur **spaces ke sath** (`1 2 3 4 5`) bhejein."
+            )
             return True
 
 
