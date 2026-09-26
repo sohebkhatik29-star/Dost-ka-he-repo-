@@ -39,7 +39,7 @@ elif os.path.exists('user_session.session'):
 
 # In-memory stores
 user_sessions = {}
-login_states = {} # For interactive login flow: step, phone, phone_code_hash, client
+login_states = {} # For admin interactive login flow: step, phone, phone_code_hash, client
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -64,48 +64,48 @@ async def ensure_user_client():
 @bot_client.on(events.NewMessage(pattern=r'^/start$'))
 async def start_handler(event: Message):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        await event.reply("⛔ **Access Denied**\n\nThis bot is private and accessible only to authorized administrators.", buttons=Button.clear())
-        return
-
+    admin_user = is_admin(sender_id)
     is_logged_in = await ensure_user_client()
-    status_badge = "🟢 **Engine Active (Ready to check)**" if is_logged_in else "🟡 **Needs 1-Time Account Connect**"
 
     welcome_text = (
         "💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\n"
-        "A smart and fast bot to clean up your Telegram invite links and keep only active ones.\n\n"
-        f"📡 **Status:** {status_badge}\n\n"
+        "A smart and lightning-fast bot to verify Telegram invite links and filter active ones.\n\n"
         "⚡ **Features:**\n"
         "• Bulk link extraction from messy text/chats\n"
         "• Deep MTProto validation (Active, Expired, Revoked)\n"
-        "• Duplicate link removal\n"
+        "• Duplicate link removal automatically\n"
         "• Live progress tracking\n"
         "• Export active links as Text or .TXT File\n\n"
         "📥 **How to use:**\n"
-        "Send or forward any message with Telegram links here!"
+        "Simply send or forward any message containing Telegram links here!"
     )
     
     buttons = []
-    if not is_logged_in:
-        buttons.append([Button.inline("🔑 Connect Account (1-Click Setup)", data=b"start_login_flow")])
-    buttons.append([Button.inline("ℹ️ Bot Info & Limits", data=b"help_info"), Button.inline("⚙️ Check Status", data=b"bot_status")])
+    # Admin-only management buttons
+    if admin_user and not is_logged_in:
+        buttons.append([Button.inline("🔑 Admin: Connect Account (1-Click)", data=b"start_login_flow")])
+    
+    buttons.append([
+        Button.inline("ℹ️ Bot Info / Limits", data=b"help_info"),
+        Button.inline("⚙️ Bot Status", data=b"bot_status")
+    ])
     
     await event.reply(welcome_text, buttons=buttons)
 
 
-# --- INTERACTIVE 1-CLICK LOGIN FLOW ---
+# --- ADMIN-ONLY LOGIN FLOW ---
 
 @bot_client.on(events.CallbackQuery(data=b"start_login_flow"))
 async def start_login_callback(event):
     sender_id = event.sender_id
     if not is_admin(sender_id):
-        return await event.answer("Access Denied", alert=True)
+        return await event.answer("⚠️ Admin only action.", alert=True)
 
     login_states[sender_id] = {'step': 'awaiting_phone'}
     
     prompt_text = (
-        "📱 **Connect Telegram Account (1-Time Step)**\n\n"
-        "Telegram API requires an account connection to verify private invite links (`t.me/+...`).\n\n"
+        "📱 **Connect Admin Account Engine (1-Time Setup)**\n\n"
+        "Telegram API requires an account connection to verify private invite links (`t.me/+...`) for all users.\n\n"
         "👉 **Abhi apna Phone Number reply karein** (Country code ke sath):\n\n"
         "Example: `+919876543210`"
     )
@@ -115,8 +115,10 @@ async def start_login_callback(event):
 @bot_client.on(events.CallbackQuery(data=b"cancel_login"))
 async def cancel_login_callback(event):
     sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Access Denied", alert=True)
     login_states.pop(sender_id, None)
-    await event.edit("❌ Connection cancelled. You can connect anytime by typing `/login`.")
+    await event.edit("❌ Connection cancelled. You can connect anytime.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/login(?:\s+(.+))?$'))
@@ -139,6 +141,9 @@ async def login_cmd_handler(event: Message):
 
 async def process_phone_submission(event: Message, sender_id: int, phone_raw: str):
     global user_client
+    if not is_admin(sender_id):
+        return
+
     phone = phone_raw.replace(" ", "").replace("-", "")
     if not phone.startswith("+") and phone.isdigit() and len(phone) == 10:
         phone = "+91" + phone
@@ -171,6 +176,9 @@ async def process_phone_submission(event: Message, sender_id: int, phone_raw: st
 
 async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
     global user_client, user_session_str
+    if not is_admin(sender_id):
+        return False
+
     state = login_states.get(sender_id)
     if not state or state.get('step') != 'awaiting_otp':
         return False
@@ -186,12 +194,11 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
         login_states.pop(sender_id, None)
 
         await event.reply(
-            "🎉 **SUCCESS: Account Connected!**\n\n"
-            "✅ Private invite link checking is now **100% Active & Accurate**.\n\n"
-            "🚀 Ab aap koi bhi links bhej kar **Start Checking** dabayein!"
+            "🎉 **SUCCESS: Engine Connected!**\n\n"
+            "✅ Private invite link checking is now **100% Active for ALL users**.\n\n"
+            "🚀 Koi bhi user ab links bhej kar direct check kar sakta hai!"
         )
 
-        # If user had pending links, auto-prompt to check
         session = user_sessions.get(sender_id)
         if session and session.get('pending_links'):
             links = session['pending_links']
@@ -199,7 +206,7 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
                 [Button.inline(f"🚀 Check {len(links)} Pending Links Now", data=b"start_check")],
                 [Button.inline("❌ Cancel", data=b"cancel_check")]
             ]
-            await event.reply(f"🔗 Aapki `{len(links)}` links queue mein hain. Check start karein?", buttons=buttons)
+            await event.reply(f"🔗 Aapki `{len(links)}` links ready hain. Check start karein?", buttons=buttons)
         return True
 
     except Exception as e:
@@ -218,6 +225,9 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
 
 async def process_password_submission(event: Message, sender_id: int, password_raw: str):
     global user_client, user_session_str
+    if not is_admin(sender_id):
+        return False
+
     state = login_states.get(sender_id)
     if not state or state.get('step') != 'awaiting_password':
         return False
@@ -234,8 +244,8 @@ async def process_password_submission(event: Message, sender_id: int, password_r
 
         await event.reply(
             "🎉 **SUCCESS: 2FA Login Completed!**\n\n"
-            "✅ Private invite link checking is now **100% Active & Accurate**.\n\n"
-            "🚀 Ab aap links bhej kar check start kar sakte hain!"
+            "✅ Private invite link checking is now **100% Active for ALL users**.\n\n"
+            "🚀 All users can now check links freely!"
         )
         return True
     except Exception as e:
@@ -247,91 +257,84 @@ async def process_password_submission(event: Message, sender_id: int, password_r
 
 @bot_client.on(events.CallbackQuery(data=b"help_info"))
 async def help_callback(event):
-    if not is_admin(event.sender_id):
-        return await event.answer("Access Denied", alert=True)
-        
     help_text = (
         "📋 **Supported Links & Limits:**\n\n"
         "• Private Invites: `https://t.me/+...` or `t.me/joinchat/...`\n"
         "• Public Chats/Channels: `https://t.me/username`\n"
         f"• Global Limit: Up to **{MAX_LINKS_PER_BATCH} links** per batch.\n"
         f"• Safe Rate-Limit Delay: **{CHECK_DELAY}s** per link.\n\n"
-        "Send your links directly as text anytime."
+        "Simply send or forward your links directly as text anytime."
     )
     await event.edit(help_text, buttons=[[Button.inline("⬅️ Back", data=b"back_to_start")]])
 
 
 @bot_client.on(events.CallbackQuery(data=b"bot_status"))
 async def status_callback(event):
-    if not is_admin(event.sender_id):
-        return await event.answer("Access Denied", alert=True)
-    
+    sender_id = event.sender_id
+    admin_user = is_admin(sender_id)
     is_user_auth = await ensure_user_client()
-    user_auth_str = "✅ Connected (Active)" if is_user_auth else "❌ Not Connected (Tap 'Connect Account')"
+    user_auth_str = "✅ Active & Ready" if is_user_auth else "🟡 Initializing"
     
     status_text = (
-        "✅ **Bot Status: ONLINE**\n\n"
-        f"👤 **Configured Admins:** `{len(ADMIN_IDS)}`\n"
-        f"🔑 **MTProto Engine:** `{user_auth_str}`\n"
-        f"⏱️ **Delay:** `{CHECK_DELAY}s`\n"
+        "✅ **Bot Status: ONLINE & ACTIVE (Public Mode)**\n\n"
+        f"🌐 **Access:** Open for all Telegram users\n"
+        f"🔑 **Checking Engine:** `{user_auth_str}`\n"
+        f"⏱️ **Safe Delay:** `{CHECK_DELAY}s`\n"
         f"📦 **Max Batch Size:** `{MAX_LINKS_PER_BATCH}`\n"
     )
     buttons = []
-    if not is_user_auth:
-        buttons.append([Button.inline("🔑 Connect Account", data=b"start_login_flow")])
+    if admin_user and not is_user_auth:
+        buttons.append([Button.inline("🔑 Admin: Connect Engine", data=b"start_login_flow")])
     buttons.append([Button.inline("⬅️ Back", data=b"back_to_start")])
     await event.edit(status_text, buttons=buttons)
 
 
 @bot_client.on(events.CallbackQuery(data=b"back_to_start"))
 async def back_callback(event):
-    if not is_admin(event.sender_id):
-        return await event.answer("Access Denied", alert=True)
-        
+    sender_id = event.sender_id
+    admin_user = is_admin(sender_id)
     is_logged_in = await ensure_user_client()
-    status_badge = "🟢 **Engine Active**" if is_logged_in else "🟡 **Account Connect Needed**"
 
     welcome_text = (
         "💎 **Telegram Bulk Invite Link Checker Bot**\n\n"
-        f"📡 **Status:** {status_badge}\n\n"
         "Send or forward any text message with Telegram invite links to start checking."
     )
     buttons = []
-    if not is_logged_in:
-        buttons.append([Button.inline("🔑 Connect Account", data=b"start_login_flow")])
-    buttons.append([Button.inline("ℹ️ Bot Info / Limits", data=b"help_info"), Button.inline("⚙️ Check Status", data=b"bot_status")])
+    if admin_user and not is_logged_in:
+        buttons.append([Button.inline("🔑 Admin: Connect Account", data=b"start_login_flow")])
+    buttons.append([
+        Button.inline("ℹ️ Bot Info / Limits", data=b"help_info"),
+        Button.inline("⚙️ Bot Status", data=b"bot_status")
+    ])
     await event.edit(welcome_text, buttons=buttons)
 
 
-# --- MESSAGE & LINK RECEIVER HANDLER ---
+# --- MESSAGE & LINK RECEIVER (OPEN TO ALL USERS) ---
 
-@client_on_msg = bot_client.on(events.NewMessage)
+@bot_client.on(events.NewMessage)
 async def message_handler(event: Message):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        return
-
     text_content = (event.text or "").strip()
     if not text_content:
         return
 
-    # Check if user is in an active login flow
-    state = login_states.get(sender_id)
-    if state:
-        step = state.get('step')
-        if step == 'awaiting_phone':
-            await process_phone_submission(event, sender_id, text_content)
-            return
-        elif step == 'awaiting_otp':
-            # Digits only or with /otp
-            otp_cleaned = text_content.replace('/otp', '').strip()
-            if otp_cleaned.isdigit() or len(otp_cleaned) in (5, 6):
-                await process_otp_submission(event, sender_id, otp_cleaned)
+    # Check if admin is in login flow
+    if is_admin(sender_id):
+        state = login_states.get(sender_id)
+        if state:
+            step = state.get('step')
+            if step == 'awaiting_phone':
+                await process_phone_submission(event, sender_id, text_content)
                 return
-        elif step == 'awaiting_password':
-            pwd_cleaned = text_content.replace('/password', '').strip()
-            await process_password_submission(event, sender_id, pwd_cleaned)
-            return
+            elif step == 'awaiting_otp':
+                otp_cleaned = text_content.replace('/otp', '').strip()
+                if otp_cleaned.isdigit() or len(otp_cleaned) in (5, 6):
+                    await process_otp_submission(event, sender_id, otp_cleaned)
+                    return
+            elif step == 'awaiting_password':
+                pwd_cleaned = text_content.replace('/password', '').strip()
+                await process_password_submission(event, sender_id, pwd_cleaned)
+                return
 
     # Handle document upload
     if event.file and event.file.name and event.file.name.endswith('.txt'):
@@ -346,7 +349,7 @@ async def message_handler(event: Message):
     if text_content.startswith('/'):
         return
 
-    # Extract unique links
+    # Extract unique links from messy text
     links = extract_telegram_links(text_content)
     if not links:
         return
@@ -364,31 +367,16 @@ async def message_handler(event: Message):
         'started_at': None
     }
 
-    is_logged_in = await ensure_user_client()
-    
-    if not is_logged_in:
-        buttons = [
-            [Button.inline("🔑 Connect Account to Check (1-Click)", data=b"start_login_flow")],
-            [Button.inline(f"🚀 Try Checking Anyway ({len(links)} Links)", data=b"start_check")],
-            [Button.inline("❌ Cancel", data=b"cancel_check")]
-        ]
-        await event.reply(
-            f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
-            "⚠️ **Note:** Telegram account is not connected yet.\n"
-            "To check private invite links (`t.me/+...`), tap **Connect Account** below.",
-            buttons=buttons
-        )
-    else:
-        buttons = [
-            [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
-            [Button.inline("❌ Cancel", data=b"cancel_check")]
-        ]
-        await event.reply(
-            f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
-            "Duplicate links have been automatically removed.\n"
-            "Click **Start Checking** to begin verification.",
-            buttons=buttons
-        )
+    buttons = [
+        [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
+        [Button.inline("❌ Cancel", data=b"cancel_check")]
+    ]
+    await event.reply(
+        f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
+        "Duplicate links have been automatically removed.\n"
+        "Click **Start Checking** to begin verification.",
+        buttons=buttons
+    )
 
 
 # --- CHECKING & PROGRESS WORKFLOW ---
@@ -396,9 +384,6 @@ async def message_handler(event: Message):
 @bot_client.on(events.CallbackQuery(data=b"cancel_check"))
 async def cancel_callback(event):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        return await event.answer("Access Denied", alert=True)
-        
     user_sessions.pop(sender_id, None)
     await event.edit("❌ **Operation Cancelled.** Send new links anytime.")
 
@@ -406,9 +391,6 @@ async def cancel_callback(event):
 @bot_client.on(events.CallbackQuery(data=b"start_check"))
 async def start_check_callback(event):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        return await event.answer("Access Denied", alert=True)
-        
     session = user_sessions.get(sender_id)
     if not session or not session.get('pending_links'):
         return await event.edit("⚠️ No links found in queue. Please send your links again.")
@@ -416,22 +398,15 @@ async def start_check_callback(event):
     links = session['pending_links']
     total_count = len(links)
     
-    # Determine which client to use: Prefer user_client if logged in, fallback to bot_client
+    # Determine active MTProto client
     is_user_auth = await ensure_user_client()
     active_client = user_client if is_user_auth else bot_client
 
-    if not is_user_auth:
-        await event.edit(
-            f"🔄 **Starting Verification (Public entities only)...**\n\n"
-            f"⚠️ *Note: User session is not logged in. For private links (t.me/+...), tap 'Connect Account'.*\n"
-            f"📊 Total Links: `{total_count}`"
-        )
-    else:
-        await event.edit(
-            f"🔄 **Starting Verification (Full MTProto Engine)...**\n\n"
-            f"📊 Total Links: `{total_count}`\n"
-            f"⏳ Validating links safely..."
-        )
+    await event.edit(
+        f"🔄 **Starting Verification...**\n\n"
+        f"📊 Total Links: `{total_count}`\n"
+        f"⏳ Validating links safely..."
+    )
 
     working_list = []
     expired_list = []
@@ -486,9 +461,7 @@ async def start_check_callback(event):
     )
     
     if error_list:
-        summary_text += f"• ⚠️ **Could Not Check (Rate/Session):** `{len(error_list)}`\n"
-        if not is_user_auth:
-            summary_text += "\n*(💡 Private links require connecting your Telegram account)*\n"
+        summary_text += f"• ⚠️ **Could Not Check:** `{len(error_list)}`\n"
 
     summary_text += "\n**Choose how to receive working links:**"
 
@@ -506,9 +479,6 @@ async def start_check_callback(event):
 @bot_client.on(events.CallbackQuery(data=b"get_as_text"))
 async def get_text_callback(event):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        return await event.answer("Access Denied", alert=True)
-
     session = user_sessions.get(sender_id)
     if not session or not session.get('results'):
         return await event.answer("No completed results found. Please check again.", alert=True)
@@ -550,9 +520,6 @@ async def get_text_callback(event):
 @bot_client.on(events.CallbackQuery(data=b"get_as_file"))
 async def get_file_callback(event):
     sender_id = event.sender_id
-    if not is_admin(sender_id):
-        return await event.answer("Access Denied", alert=True)
-
     session = user_sessions.get(sender_id)
     if not session or not session.get('results'):
         return await event.answer("No completed results found. Please check again.", alert=True)
@@ -612,7 +579,7 @@ async def main():
         print(f"Web server notice: {e}")
         
     print("="*60)
-    print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING...")
+    print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING (PUBLIC MODE)...")
     print(f"👤 Configured Admin IDs: {ADMIN_IDS}")
     print(f"⏱️ Safe Check Delay: {CHECK_DELAY}s")
     print("="*60)
