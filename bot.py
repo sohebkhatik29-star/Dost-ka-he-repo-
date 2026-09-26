@@ -3,6 +3,7 @@ import io
 import json
 import asyncio
 import time
+import re
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
@@ -29,7 +30,7 @@ if not validate_config():
     print("❌ Cannot start bot. Please verify your environment variables.")
     exit(1)
 
-# Persistent file paths
+# Ensure data directory exists
 os.makedirs("data", exist_ok=True)
 USERS_FILE = "data/users.json"
 BANNED_FILE = "data/banned.json"
@@ -104,50 +105,41 @@ async def ensure_user_client():
 
 # --- LOG CHANNEL DISPATCHER ---
 
-async def send_to_log_channel(msg: str):
-    """Safely dispatches markdown messages to the Log Channel."""
-    try:
-        if LOG_CHANNEL_ID:
-            await bot_client.send_message(LOG_CHANNEL_ID, msg, link_preview=False)
-    except Exception as e:
-        print(f"⚠️ Log Channel Send Error: {e}")
-
-
 async def log_bot_startup():
-    """Sends a one-time message when the bot starts/restarts."""
+    """Sends log when bot starts online."""
     try:
         await asyncio.sleep(2)
-        start_msg = (
+        log_msg = (
             "🟢 **#BOT_STARTED / ONLINE**\n\n"
             f"🤖 **Bot:** {BOT_USERNAME}\n"
-            f"👥 **Registered Users:** `{len(known_users)}`\n"
-            f"⏱️ **Boot Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n\n"
+            f"👥 **Total Registered Users:** `{len(known_users)}`\n"
+            f"⏰ **Boot Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n\n"
             "🚀 *Bot is active and running 24/7!*"
         )
-        await send_to_log_channel(start_msg)
+        await bot_client.send_message(LOG_CHANNEL_ID, log_msg)
     except Exception as e:
-        print(f"Log Error (Bot Start): {e}")
+        print(f"Startup log notice: {e}")
 
 
 async def log_new_user_start(user):
     """Sends log ONLY when a brand new user starts the bot for the first time."""
     try:
         user_id = user.id
-        first_name = getattr(user, 'first_name', None) or "Unknown"
-        last_name = getattr(user, 'last_name', None) or ""
+        first_name = user.first_name or "Unknown"
+        last_name = user.last_name or ""
         full_name = f"{first_name} {last_name}".strip()
-        username = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
+        username = f"@{user.username}" if user.username else "No Username"
         total_count = len(known_users)
 
         log_msg = (
             "🆕 **#NEW_USER_STARTED**\n\n"
-            f"👤 **Name:** [{full_name}](tg://user?id={user_id})\n"
+            f"👤 **User:** [{full_name}](tg://user?id={user_id})\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"🔗 **Username:** {username}\n"
-            f"👥 **Total Bot Users:** `{total_count}`\n"
-            f"📅 **Date:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
+            f"👥 **Total Registered Users:** `{total_count}`\n"
+            f"📅 **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
         )
-        await send_to_log_channel(log_msg)
+        await bot_client.send_message(LOG_CHANNEL_ID, log_msg)
     except Exception as e:
         print(f"Log Error (New User): {e}")
 
@@ -155,36 +147,36 @@ async def log_new_user_start(user):
 async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
     """Sends log to log channel whenever any user checks links."""
     try:
-        user_id = getattr(user, 'id', 'Unknown')
-        first_name = getattr(user, 'first_name', None) or "Unknown"
-        username = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
+        user_id = user.id
+        first_name = user.first_name or "Unknown"
+        username = f"@{user.username}" if user.username else "No Username"
         
         log_msg = (
             "🔗 **#LINK_CHECK_LOG**\n\n"
             f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
             f"🆔 **User ID:** `{user_id}`\n\n"
             f"📊 **Statistics:**\n"
-            f"• Total Links Checked: `{total_links}`\n"
+            f"• Total Links: `{total_links}`\n"
             f"• ✅ Working: `{len(working_links)}`\n"
             f"• ❌ Expired: `{len(expired_links)}`\n\n"
         )
 
         if working_links:
             log_msg += "✅ **Working Links:**\n"
-            for item in working_links[:15]:
+            for item in working_links[:10]:
                 log_msg += f"• `{item['url']}`\n"
-            if len(working_links) > 15:
-                log_msg += f"... and `{len(working_links) - 15}` more\n"
+            if len(working_links) > 10:
+                log_msg += f"... and `{len(working_links) - 10}` more\n"
             log_msg += "\n"
 
         if expired_links:
             log_msg += "❌ **Expired Links:**\n"
-            for item in expired_links[:8]:
+            for item in expired_links[:5]:
                 log_msg += f"• `{item['url']}`\n"
-            if len(expired_links) > 8:
-                log_msg += f"... and `{len(expired_links) - 8}` more\n"
+            if len(expired_links) > 5:
+                log_msg += f"... and `{len(expired_links) - 5}` more\n"
 
-        await send_to_log_channel(log_msg)
+        await bot_client.send_message(LOG_CHANNEL_ID, log_msg, link_preview=False)
     except Exception as e:
         print(f"Log Error (Link Activity): {e}")
 
@@ -197,7 +189,7 @@ async def get_fsub_invite_link():
         chat = await bot_client.get_entity(FSUB_CHANNEL_ID)
         if getattr(chat, 'username', None):
             return f"https://t.me/{chat.username}"
-        inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=FSUB_CHANNEL_ID))
+        inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=chat))
         return inv.link
     except Exception:
         return "https://t.me/Aysha_sama"
@@ -208,8 +200,9 @@ async def check_fsub_membership(user_id: int) -> bool:
     if is_admin(user_id):
         return True
     try:
+        chat = await bot_client.get_entity(FSUB_CHANNEL_ID)
         participant = await bot_client(functions.channels.GetParticipantRequest(
-            channel=FSUB_CHANNEL_ID,
+            channel=chat,
             participant=user_id
         ))
         if participant:
@@ -218,7 +211,7 @@ async def check_fsub_membership(user_id: int) -> bool:
         err_str = str(e).lower()
         if "user_not_participant" in err_str:
             return False
-        # If bot is not admin in channel, don't block users
+        # If bot is not in channel or peer error, don't block user
         return True
     return True
 
@@ -283,6 +276,7 @@ async def send_start_view(target, user_id: int):
         )
         
         buttons = []
+        
         if admin_user and not is_logged_in:
             buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
         
@@ -304,7 +298,7 @@ async def send_start_view(target, user_id: int):
         print(f"Error in send_start_view: {e}")
 
 
-@bot_client.on(events.NewMessage(pattern=r'^/start$'))
+@bot_client.on(events.NewMessage(pattern=r'^/start(?:\s+.*)?$'))
 async def start_handler(event: Message):
     try:
         sender = await event.get_sender()
@@ -317,7 +311,8 @@ async def start_handler(event: Message):
         if sender_id not in known_users:
             known_users.add(sender_id)
             save_json_set(USERS_FILE, known_users)
-            asyncio.create_task(log_new_user_start(sender))
+            if sender:
+                asyncio.create_task(log_new_user_start(sender))
 
         # Check Force Sub
         is_member = await check_fsub_membership(sender_id)
@@ -338,7 +333,7 @@ async def back_callback(event):
     await send_start_view(event, event.sender_id)
 
 
-@bot_client.on(events.NewMessage(pattern=r'^/help$'))
+@bot_client.on(events.NewMessage(pattern=r'^/help(?:\s+.*)?$'))
 async def help_cmd_handler(event: Message):
     if is_banned(event.sender_id):
         return
@@ -374,7 +369,7 @@ async def send_help_view(target):
         await target.edit(help_text, buttons=buttons)
 
 
-@bot_client.on(events.NewMessage(pattern=r'^/about$'))
+@bot_client.on(events.NewMessage(pattern=r'^/about(?:\s+.*)?$'))
 async def about_cmd_handler(event: Message):
     if is_banned(event.sender_id):
         return
@@ -491,7 +486,7 @@ async def unban_user_handler(event: Message):
         await event.reply(f"ℹ️ User `{target_id}` is not in the banned list.")
 
 
-@bot_client.on(events.NewMessage(pattern=r'^/banned$'))
+@bot_client.on(events.NewMessage(pattern=r'^/banned(?:\s+.*)?$'))
 async def list_banned_handler(event: Message):
     if not is_admin(event.sender_id):
         return
@@ -686,6 +681,10 @@ async def message_handler(event: Message):
                 await process_password_submission(event, sender_id, pwd_cleaned)
                 return
 
+    # Ignore commands
+    if text_content.startswith('/'):
+        return
+
     # Handle document upload
     if event.file and event.file.name and event.file.name.endswith('.txt'):
         try:
@@ -694,10 +693,6 @@ async def message_handler(event: Message):
         except Exception as e:
             await event.reply(f"⚠️ Could not read document: {str(e)}")
             return
-
-    # Ignore commands
-    if text_content.startswith('/'):
-        return
 
     # Check Force Sub
     if not await check_fsub_membership(sender_id):
@@ -760,6 +755,8 @@ async def start_check_callback(event):
     
     # Check if MTProto engine is connected
     is_user_auth = await ensure_user_client()
+    
+    # Check if batch contains private links
     has_private_links = any(parse_link(u)[0] == 'invite' for u in links)
 
     if has_private_links and not is_user_auth:
@@ -831,7 +828,8 @@ async def start_check_callback(event):
 
     # Dispatch Activity Log to Log Channel
     sender_obj = await event.get_sender()
-    asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
+    if sender_obj:
+        asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
 
     working_pct = (len(working_list) / total_count * 100) if total_count > 0 else 0
     expired_pct = (len(expired_list) / total_count * 100) if total_count > 0 else 0
@@ -969,9 +967,7 @@ async def main():
     print(f"🔒 Force Sub Channel: {FSUB_CHANNEL_ID}")
     print("="*60)
     
-    # Send bot startup notification to log channel
     asyncio.create_task(log_bot_startup())
-    
     await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
