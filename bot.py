@@ -7,28 +7,23 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 from telethon.tl import functions, types
-from telethon.errors import (
-    UserNotParticipantError,
-    ChannelPrivateError,
-    ChatAdminRequiredError
-)
 
 from config import (
     API_ID,
     API_HASH,
     BOT_TOKEN,
     ADMIN_IDS,
-    LOG_CHANNEL_ID,
-    FSUB_CHANNEL_ID,
-    BOT_USERNAME,
-    OWNER_USERNAME,
-    DEVELOPER_USERNAME,
     CHECK_DELAY,
     MAX_LINKS_PER_BATCH,
     SESSION_STRING,
+    BOT_USERNAME,
+    OWNER_USERNAME,
+    DEVELOPER_USERNAME,
+    LOG_CHANNEL_ID,
+    FSUB_CHANNEL_ID,
     validate_config
 )
-from checker import extract_telegram_links, check_single_link
+from checker import extract_telegram_links, check_single_link, parse_link
 
 if not validate_config():
     print("❌ Cannot start bot. Please verify your environment variables.")
@@ -38,6 +33,7 @@ if not validate_config():
 os.makedirs("data", exist_ok=True)
 USERS_FILE = "data/users.json"
 BANNED_FILE = "data/banned.json"
+SAVED_SESSION_FILE = "data/session.txt"
 
 def load_json_set(file_path: str) -> set:
     if os.path.exists(file_path):
@@ -64,6 +60,13 @@ bot_client = TelegramClient('tg_bot_session', API_ID, API_HASH).start(bot_token=
 
 # 2. MTProto User Client (for private invite links checking)
 user_session_str = SESSION_STRING
+if not user_session_str and os.path.exists(SAVED_SESSION_FILE):
+    try:
+        with open(SAVED_SESSION_FILE, "r") as f:
+            user_session_str = f.read().strip()
+    except Exception:
+        pass
+
 user_client = None
 
 if user_session_str:
@@ -110,7 +113,6 @@ async def get_fsub_invite_link():
         inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=FSUB_CHANNEL_ID))
         return inv.link
     except Exception:
-        # Fallback to direct link or format
         return f"https://t.me/c/{str(FSUB_CHANNEL_ID).replace('-100', '')}"
 
 
@@ -123,199 +125,175 @@ async def check_fsub_membership(user_id: int) -> bool:
             channel=FSUB_CHANNEL_ID,
             participant=user_id
         ))
-        if participant and not isinstance(participant.participant, types.ChannelParticipantBanned):
+        if participant:
             return True
-        return False
-    except UserNotParticipantError:
-        return False
     except Exception as e:
-        # If bot is not admin in channel or error occurs, allow access safely
-        print(f"FSub check notice: {e}")
+        err_str = str(e).lower()
+        if "user_not_participant" in err_str:
+            return False
         return True
+    return False
 
 
 async def send_fsub_prompt(event, user_id: int):
-    """Sends the Force Sub join message with buttons."""
-    fsub_link = await get_fsub_invite_link()
-    text = (
-        "📢 **Must Join Channel to Use Bot!**\n\n"
-        "Aapko pehle hamara Official Channel join karna hoga.\n"
-        "Neeche diye gaye **[📢 Join Channel]** button par click karke join karein aur phir **[🔄 Try Again]** dabayein!"
+    """Prompts the user to join the Force Sub channel before using the bot."""
+    channel_link = await get_fsub_invite_link()
+    fsub_text = (
+        "🔒 **Access Restricted: Join Channel First**\n\n"
+        "Aapko bot use karne ke liye hamare official channel ko join karna zaroori hai.\n\n"
+        "👉 **Neeche button par click karke channel join karein**, phir **'🔄 Try Again'** dabayein."
     )
     buttons = [
-        [Button.url("📢 Join Channel", fsub_link)],
-        [Button.inline("🔄 Try Again / I Have Joined", data=b"check_fsub_retry")]
+        [Button.url("📢 Join Channel", channel_link)],
+        [Button.inline("🔄 Try Again", data=b"check_fsub_again")]
     ]
     if isinstance(event, Message):
-        await event.reply(text, buttons=buttons)
+        await event.reply(fsub_text, buttons=buttons)
     else:
-        await event.edit(text, buttons=buttons)
+        await event.edit(fsub_text, buttons=buttons)
 
 
-# --- LOG CHANNEL DISPATCHERS ---
+@bot_client.on(events.CallbackQuery(data=b"check_fsub_again"))
+async def check_fsub_again_callback(event):
+    user_id = event.sender_id
+    if is_banned(user_id):
+        return await event.answer("You are banned from using this bot.", alert=True)
+
+    is_member = await check_fsub_membership(user_id)
+    if is_member:
+        await event.answer("✅ Channel verification successful! Welcome.", alert=True)
+        await send_start_view(event, user_id)
+    else:
+        await event.answer("❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", alert=True)
+
+
+# --- LOG CHANNEL DISPATCHER ---
 
 async def log_new_user_start(user):
-    """Logs the first-time bot start to the Log Channel."""
+    """Sends log when a user starts the bot for the FIRST time."""
     try:
         user_id = user.id
-        first_name = user.first_name or ""
+        first_name = user.first_name or "Unknown"
         last_name = user.last_name or ""
-        full_name = f"{first_name} {last_name}".strip() or "Anonymous"
-        username_str = f"@{user.username}" if user.username else "No Username"
+        full_name = f"{first_name} {last_name}".strip()
+        username = f"@{user.username}" if user.username else "No Username"
         total_count = len(known_users)
 
-        log_text = (
-            "🔔 **#NEW_USER_STARTED**\n\n"
+        log_msg = (
+            "🆕 **#NEW_USER_STARTED**\n\n"
             f"👤 **Name:** [{full_name}](tg://user?id={user_id})\n"
             f"🆔 **User ID:** `{user_id}`\n"
-            f"🔗 **Username:** {username_str}\n"
-            f"👥 **Total Unique Users:** `{total_count}`\n"
-            f"🕒 **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
+            f"🔗 **Username:** {username}\n"
+            f"👥 **Total Bot Users:** `{total_count}`\n"
+            f"📅 **Date:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
         )
-        await bot_client.send_message(LOG_CHANNEL_ID, log_text, link_preview=False)
+        await bot_client.send_message(LOG_CHANNEL_ID, log_msg)
     except Exception as e:
-        print(f"Log new user notice: {e}")
+        print(f"Log Error (New User): {e}")
 
 
-async def log_link_check_batch(user, total_links: int, working_links: list, expired_links: list, raw_links: list):
-    """Logs every link check activity by users to the Log Channel."""
+async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
+    """Sends log to log channel whenever any user checks links."""
     try:
         user_id = user.id
-        first_name = getattr(user, 'first_name', '') or ''
-        last_name = getattr(user, 'last_name', '') or ''
-        full_name = f"{first_name} {last_name}".strip() or "User"
-        username_str = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
-
-        header = (
-            "📊 **#LINK_CHECK_LOG**\n\n"
-            f"👤 **User:** [{full_name}](tg://user?id={user_id}) ({username_str})\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"🔢 **Total Links:** `{total_links}`\n"
-            f"✅ **Working:** `{len(working_links)}`\n"
-            f"❌ **Expired / Error:** `{len(expired_links)}`\n\n"
-            f"🔗 **Verified Links List:**\n"
+        first_name = user.first_name or "Unknown"
+        username = f"@{user.username}" if user.username else "No Username"
+        
+        log_msg = (
+            "🔗 **#LINK_CHECK_LOG**\n\n"
+            f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
+            f"🆔 **User ID:** `{user_id}`\n\n"
+            f"📊 **Statistics:**\n"
+            f"• Total Links Checked: `{total_links}`\n"
+            f"• ✅ Working: `{len(working_links)}`\n"
+            f"• ❌ Expired: `{len(expired_links)}`\n\n"
         )
 
-        lines = []
-        for item in working_links:
-            url = item['url']
-            title = item.get('title') or ''
-            if title:
-                lines.append(f"• ✅ [{title}]({url})")
-            else:
-                lines.append(f"• ✅ `{url}`")
+        if working_links:
+            log_msg += "✅ **Working Links:**\n"
+            for item in working_links[:10]:
+                log_msg += f"• `{item['url']}`\n"
+            if len(working_links) > 10:
+                log_msg += f"... and `{len(working_links) - 10}` more\n"
+            log_msg += "\n"
 
-        for item in expired_links:
-            lines.append(f"• ❌ `{item['url']}`")
+        if expired_links:
+            log_msg += "❌ **Expired Links:**\n"
+            for item in expired_links[:5]:
+                log_msg += f"• `{item['url']}`\n"
+            if len(expired_links) > 5:
+                log_msg += f"... and `{len(expired_links) - 5}` more\n"
 
-        full_log_text = header + "\n".join(lines)
-
-        if len(full_log_text) <= 3900:
-            await bot_client.send_message(LOG_CHANNEL_ID, full_log_text, link_preview=False)
-        else:
-            # Send overview + file
-            await bot_client.send_message(LOG_CHANNEL_ID, header, link_preview=False)
-            file_data = f"# User: {full_name} ({user_id})\n# Total: {total_links} | Working: {len(working_links)}\n\n"
-            for item in working_links:
-                file_data += f"[ACTIVE] {item['url']} | {item.get('title', '')}\n"
-            for item in expired_links:
-                file_data += f"[EXPIRED] {item['url']}\n"
-            
-            buf = io.BytesIO(file_data.encode('utf-8'))
-            buf.name = f"user_{user_id}_links.txt"
-            await bot_client.send_file(LOG_CHANNEL_ID, file=buf, caption=f"📄 Full Links Log for {full_name} (`{user_id}`)")
+        await bot_client.send_message(LOG_CHANNEL_ID, log_msg, link_preview=False)
     except Exception as e:
-        print(f"Log link check notice: {e}")
+        print(f"Log Error (Link Activity): {e}")
 
 
-# --- START & MENU HANDLERS ---
+# --- START & MENU SYSTEM ---
+
+async def send_start_view(target, user_id: int):
+    admin_user = is_admin(user_id)
+    is_logged_in = await ensure_user_client()
+
+    welcome_text = (
+        "💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\n"
+        "A smart and lightning-fast bot to verify Telegram invite links and filter active ones.\n\n"
+        "⚡ **Features:**\n"
+        "• Bulk link extraction from messy text/chats\n"
+        "• Deep MTProto validation (Active, Expired, Revoked)\n"
+        "• Duplicate link removal automatically\n"
+        "• Live progress tracking\n"
+        "• Export active links as Text or .TXT File\n\n"
+        "📥 **How to use:**\n"
+        "Simply send or forward any message containing Telegram links here!"
+    )
+    
+    buttons = []
+    
+    if admin_user and not is_logged_in:
+        buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
+    
+    buttons.append([
+        Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
+        Button.inline("📖 About Bot", data=b"menu_about")
+    ])
+    
+    row2 = [Button.inline("⚙️ Bot Status", data=b"menu_status")]
+    if admin_user:
+        row2.append(Button.inline("🛡️ Admin Panel", data=b"menu_admin_stats"))
+    buttons.append(row2)
+
+    if isinstance(target, Message):
+        await target.reply(welcome_text, buttons=buttons)
+    else:
+        await target.edit(welcome_text, buttons=buttons)
+
 
 @bot_client.on(events.NewMessage(pattern=r'^/start$'))
 async def start_handler(event: Message):
-    sender_id = event.sender_id
-    if is_banned(sender_id):
-        return await event.reply("⛔ **You are banned from using this bot.**", buttons=Button.clear())
-
     sender = await event.get_sender()
+    sender_id = event.sender_id
 
-    # Check first-time user registration & log
+    if is_banned(sender_id):
+        return await event.reply("⛔ You are banned from using this bot.")
+
+    # Check and Log First Time Start
     if sender_id not in known_users:
         known_users.add(sender_id)
         save_json_set(USERS_FILE, known_users)
-        await log_new_user_start(sender)
+        asyncio.create_task(log_new_user_start(sender))
 
-    # Check Force Subscribe
-    is_fsub = await check_fsub_membership(sender_id)
-    if not is_fsub:
+    # Check Force Sub
+    if not await check_fsub_membership(sender_id):
         return await send_fsub_prompt(event, sender_id)
 
-    is_logged_in = await ensure_user_client()
-    status_badge = "🟢 **Active & High-Speed**" if is_logged_in else "🟡 **Online**"
-
-    welcome_text = (
-        f"👋 **Hello, {sender.first_name}!**\n\n"
-        f"💎 Welcome to **{BOT_USERNAME}** — The ultimate Telegram Bulk Invite Link Checker & Filter Bot.\n\n"
-        f"📡 **Status:** {status_badge}\n\n"
-        "⚡ **Key Features:**\n"
-        "• 🔍 Bulk extract links from messy text or forwarded chats\n"
-        "• ✅ Deep MTProto check (Detects Active, Expired, Revoked)\n"
-        "• 🧹 Automatic duplicate removal\n"
-        "• 📊 Live real-time checking progress\n"
-        "• 📁 Export working links as Text or `.TXT` File\n\n"
-        "📥 **How to Use:**\n"
-        "Simply send or forward any message with Telegram links here to start!"
-    )
-    
-    buttons = [
-        [
-            Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
-            Button.inline("📖 About Bot", data=b"menu_about")
-        ]
-    ]
-
-    # Admin controls
-    if is_admin(sender_id):
-        admin_row = []
-        if not is_logged_in:
-            admin_row.append(Button.inline("🔑 Admin: Connect Engine", data=b"start_login_flow"))
-        admin_row.append(Button.inline("⚙️ Admin Stats", data=b"menu_admin_stats"))
-        buttons.append(admin_row)
-    else:
-        buttons.append([Button.inline("⚙️ Bot Status", data=b"menu_status")])
-
-    await event.reply(welcome_text, buttons=buttons)
+    await send_start_view(event, sender_id)
 
 
-@bot_client.on(events.CallbackQuery(data=b"check_fsub_retry"))
-async def fsub_retry_callback(event):
-    sender_id = event.sender_id
-    if await check_fsub_membership(sender_id):
-        await event.answer("✅ Verified! Welcome to the bot.", alert=True)
-        # Re-send start menu
-        sender = await event.get_sender()
-        is_logged_in = await ensure_user_client()
-        status_badge = "🟢 **Active & High-Speed**" if is_logged_in else "🟡 **Online**"
+@bot_client.on(events.CallbackQuery(data=b"back_to_start"))
+async def back_callback(event):
+    await send_start_view(event, event.sender_id)
 
-        welcome_text = (
-            f"👋 **Hello, {sender.first_name}!**\n\n"
-            f"💎 Welcome to **{BOT_USERNAME}**\n\n"
-            f"📡 **Status:** {status_badge}\n\n"
-            "📥 **How to Use:**\n"
-            "Send or forward any message with Telegram links here to start checking!"
-        )
-        buttons = [
-            [
-                Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
-                Button.inline("📖 About Bot", data=b"menu_about")
-            ],
-            [Button.inline("⚙️ Bot Status", data=b"menu_status")]
-        ]
-        await event.edit(welcome_text, buttons=buttons)
-    else:
-        await event.answer("❌ You have not joined the channel yet! Please join first.", alert=True)
-
-
-# --- HELP & ABOUT HANDLERS ---
 
 @bot_client.on(events.NewMessage(pattern=r'^/help$'))
 async def help_cmd_handler(event: Message):
@@ -332,10 +310,14 @@ async def help_callback(event):
 async def send_help_view(target):
     help_text = (
         "ℹ️ **How to Use Telegram Link Checker Bot:**\n\n"
-        "1️⃣ **Send Links:** Forward any message or paste text containing Telegram links into this chat.\n"
-        "2️⃣ **Auto Extraction:** The bot automatically extracts all links and removes duplicates.\n"
-        "3️⃣ **Start Checking:** Click **Start Checking** to begin deep verification.\n"
-        "4️⃣ **Get Active Links:** Once done, click **[📋 Get as Text]** or **[📁 Get as File (.txt)]** to receive only 100% active links!\n\n"
+        "1️⃣ **Send or Forward Links:**\n"
+        "Send any message or forward a chat containing Telegram invite links. You can send messy text — the bot automatically extracts all links.\n\n"
+        "2️⃣ **Duplicate Cleaning:**\n"
+        "Duplicate links are automatically filtered out.\n\n"
+        "3️⃣ **Start Verification:**\n"
+        "Click `Start Checking` to run deep MTProto validation.\n\n"
+        "4️⃣ **Export Working Links:**\n"
+        "Choose `Get as Text` or download a clean `.txt` file containing only active links!\n\n"
         "📋 **Supported Links:**\n"
         "• Private Invites: `https://t.me/+...` or `t.me/joinchat/...`\n"
         "• Public Links: `https://t.me/username`\n\n"
@@ -428,44 +410,11 @@ async def admin_stats_callback(event):
     await event.edit(stats_text, buttons=buttons)
 
 
-@bot_client.on(events.CallbackQuery(data=b"back_to_start"))
-async def back_callback(event):
-    sender_id = event.sender_id
-    sender = await event.get_sender()
-    is_logged_in = await ensure_user_client()
-    status_badge = "🟢 **Active & High-Speed**" if is_logged_in else "🟡 **Online**"
-
-    welcome_text = (
-        f"👋 **Hello, {sender.first_name}!**\n\n"
-        f"💎 Welcome to **{BOT_USERNAME}**\n\n"
-        f"📡 **Status:** {status_badge}\n\n"
-        "📥 **How to Use:**\n"
-        "Send or forward any message with Telegram links here to start checking!"
-    )
-    buttons = [
-        [
-            Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
-            Button.inline("📖 About Bot", data=b"menu_about")
-        ]
-    ]
-    if is_admin(sender_id):
-        admin_row = []
-        if not is_logged_in:
-            admin_row.append(Button.inline("🔑 Admin: Connect Engine", data=b"start_login_flow"))
-        admin_row.append(Button.inline("⚙️ Admin Stats", data=b"menu_admin_stats"))
-        buttons.append(admin_row)
-    else:
-        buttons.append([Button.inline("⚙️ Bot Status", data=b"menu_status")])
-
-    await event.edit(welcome_text, buttons=buttons)
-
-
-# --- ADMIN BAN / UNBAN HANDLERS ---
+# --- ADMIN BAN & UNBAN COMMANDS ---
 
 @bot_client.on(events.NewMessage(pattern=r'^/ban(?:\s+(\d+))?$'))
-async def ban_handler(event: Message):
-    sender_id = event.sender_id
-    if not is_admin(sender_id):
+async def ban_user_handler(event: Message):
+    if not is_admin(event.sender_id):
         return
 
     target_id_str = event.pattern_match.group(1)
@@ -473,18 +422,17 @@ async def ban_handler(event: Message):
         return await event.reply("⚠️ **Usage:** `/ban <user_id>`\nExample: `/ban 123456789`")
 
     target_id = int(target_id_str)
-    if target_id in ADMIN_IDS:
-        return await event.reply("❌ You cannot ban an Admin!")
+    if is_admin(target_id):
+        return await event.reply("❌ You cannot ban an Admin/Owner!")
 
     banned_users.add(target_id)
     save_json_set(BANNED_FILE, banned_users)
-    await event.reply(f"✅ **User `{target_id}` has been banned successfully.**")
+    await event.reply(f"🚫 **User Banned:** `{target_id}` has been banned from using this bot.")
 
 
 @bot_client.on(events.NewMessage(pattern=r'^/unban(?:\s+(\d+))?$'))
-async def unban_handler(event: Message):
-    sender_id = event.sender_id
-    if not is_admin(sender_id):
+async def unban_user_handler(event: Message):
+    if not is_admin(event.sender_id):
         return
 
     target_id_str = event.pattern_match.group(1)
@@ -495,7 +443,7 @@ async def unban_handler(event: Message):
     if target_id in banned_users:
         banned_users.remove(target_id)
         save_json_set(BANNED_FILE, banned_users)
-        await event.reply(f"✅ **User `{target_id}` has been unbanned successfully.**")
+        await event.reply(f"✅ **User Unbanned:** `{target_id}` has been unbanned.")
     else:
         await event.reply(f"ℹ️ User `{target_id}` is not in the banned list.")
 
@@ -609,6 +557,12 @@ async def process_otp_submission(event: Message, sender_id: int, otp_raw: str):
         user_session_str = session_str
         login_states.pop(sender_id, None)
 
+        try:
+            with open(SAVED_SESSION_FILE, "w") as f:
+                f.write(session_str)
+        except Exception:
+            pass
+
         await event.reply(
             "🎉 **SUCCESS: Engine Connected!**\n\n"
             "✅ Private invite link checking is now **100% Active for ALL users**.\n\n"
@@ -645,6 +599,12 @@ async def process_password_submission(event: Message, sender_id: int, password_r
         user_client = client_inst
         user_session_str = session_str
         login_states.pop(sender_id, None)
+
+        try:
+            with open(SAVED_SESSION_FILE, "w") as f:
+                f.write(session_str)
+        except Exception:
+            pass
 
         await event.reply("🎉 **SUCCESS: 2FA Login Completed!**\n\n✅ Engine is now 100% active for all users.")
         return True
@@ -755,8 +715,30 @@ async def start_check_callback(event):
     links = session['pending_links']
     total_count = len(links)
     
-    # Determine active MTProto client
+    # Check if MTProto engine is connected
     is_user_auth = await ensure_user_client()
+    
+    # Check if batch contains private links
+    has_private_links = any(parse_link(u)[0] == 'invite' for u in links)
+
+    if has_private_links and not is_user_auth:
+        if is_admin(sender_id):
+            buttons = [
+                [Button.inline("🔑 Connect Engine Now (1-Click)", data=b"start_login_flow")],
+                [Button.inline("❌ Cancel", data=b"cancel_check")]
+            ]
+            return await event.edit(
+                "⚠️ **Admin Notice: MTProto Engine Disconnected**\n\n"
+                "Server restart hone par Telegram engine disconnect ho gaya hai.\n\n"
+                "👉 **Neeche button dabakar 5 second me connect karein:**",
+                buttons=buttons
+            )
+        else:
+            return await event.edit(
+                "⚠️ **Bot Engine Initializing...**\n\n"
+                "Bot is currently establishing MTProto connection. Please try again in 1 minute!"
+            )
+
     active_client = user_client if is_user_auth else bot_client
 
     await event.edit(
@@ -806,9 +788,9 @@ async def start_check_callback(event):
         'error': error_list
     }
 
-    # Log this completed check batch to Log Channel
-    sender = await event.get_sender()
-    asyncio.create_task(log_link_check_batch(sender, total_count, working_list, expired_list + error_list, links))
+    # Dispatch Activity Log to Log Channel
+    sender_obj = await event.get_sender()
+    asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
 
     working_pct = (len(working_list) / total_count * 100) if total_count > 0 else 0
     expired_pct = (len(expired_list) / total_count * 100) if total_count > 0 else 0
@@ -933,22 +915,6 @@ async def start_web_server():
     await site.start()
     print(f"🌐 Health-check web server listening on port {port} (100% Free Render Support)")
 
-async def set_bot_commands():
-    """Sets standard menu commands visible in Telegram chat."""
-    try:
-        commands = [
-            types.BotCommand(command="start", description="Start bot and main menu"),
-            types.BotCommand(command="help", description="How to use the bot"),
-            types.BotCommand(command="about", description="About bot, owner and developer")
-        ]
-        await bot_client(functions.bots.SetBotCommandsRequest(
-            scope=types.BotCommandScopeDefault(),
-            lang_code="",
-            commands=commands
-        ))
-    except Exception as e:
-        print(f"Set bot commands notice: {e}")
-
 async def main():
     try:
         await start_web_server()
@@ -956,14 +922,11 @@ async def main():
         print(f"Web server notice: {e}")
         
     print("="*60)
-    print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING (v2.0 Full Suite)...")
+    print("🚀 Telegram Bulk Invite Link Checker Bot is STARTING (PUBLIC MODE)...")
     print(f"👤 Configured Admin IDs: {ADMIN_IDS}")
-    print(f"📢 Log Channel ID: {LOG_CHANNEL_ID}")
-    print(f"🔒 Force Sub Channel ID: {FSUB_CHANNEL_ID}")
-    print(f"⏱️ Safe Check Delay: {CHECK_DELAY}s")
+    print(f"📢 Log Channel: {LOG_CHANNEL_ID}")
+    print(f"🔒 Force Sub Channel: {FSUB_CHANNEL_ID}")
     print("="*60)
-
-    await set_bot_commands()
     await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
