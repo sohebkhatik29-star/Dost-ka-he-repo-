@@ -29,7 +29,7 @@ if not validate_config():
     print("❌ Cannot start bot. Please verify your environment variables.")
     exit(1)
 
-# Ensure data directory exists
+# Persistent file paths
 os.makedirs("data", exist_ok=True)
 USERS_FILE = "data/users.json"
 BANNED_FILE = "data/banned.json"
@@ -102,24 +102,35 @@ async def ensure_user_client():
     return False
 
 
-# --- LOG CHANNEL SENDER (SAFE RESOLVER) ---
+# --- LOG CHANNEL DISPATCHER ---
 
-async def send_to_log_channel(msg_text: str):
-    """Safely dispatches log messages to the configured Log Channel."""
+async def send_to_log_channel(msg: str):
+    """Safely dispatches markdown messages to the Log Channel."""
     try:
-        await bot_client.send_message(LOG_CHANNEL_ID, msg_text, link_preview=False)
-    except ValueError:
-        try:
-            entity = await bot_client.get_entity(LOG_CHANNEL_ID)
-            await bot_client.send_message(entity, msg_text, link_preview=False)
-        except Exception as e:
-            print(f"⚠️ Log Channel Notice: {e}. (Ensure bot is ADMIN in {LOG_CHANNEL_ID})")
+        if LOG_CHANNEL_ID:
+            await bot_client.send_message(LOG_CHANNEL_ID, msg, link_preview=False)
     except Exception as e:
-        print(f"⚠️ Log Channel Notice: {e}. (Ensure bot is ADMIN in {LOG_CHANNEL_ID})")
+        print(f"⚠️ Log Channel Send Error: {e}")
 
 
-async def log_user_start_event(user, is_first_time: bool):
-    """Sends log to log channel on user start."""
+async def log_bot_startup():
+    """Sends a one-time message when the bot starts/restarts."""
+    try:
+        await asyncio.sleep(2)
+        start_msg = (
+            "🟢 **#BOT_STARTED / ONLINE**\n\n"
+            f"🤖 **Bot:** {BOT_USERNAME}\n"
+            f"👥 **Registered Users:** `{len(known_users)}`\n"
+            f"⏱️ **Boot Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n\n"
+            "🚀 *Bot is active and running 24/7!*"
+        )
+        await send_to_log_channel(start_msg)
+    except Exception as e:
+        print(f"Log Error (Bot Start): {e}")
+
+
+async def log_new_user_start(user):
+    """Sends log ONLY when a brand new user starts the bot for the first time."""
     try:
         user_id = user.id
         first_name = getattr(user, 'first_name', None) or "Unknown"
@@ -128,18 +139,17 @@ async def log_user_start_event(user, is_first_time: bool):
         username = f"@{user.username}" if getattr(user, 'username', None) else "No Username"
         total_count = len(known_users)
 
-        tag = "#NEW_USER_STARTED" if is_first_time else "#USER_START"
         log_msg = (
-            f"🚀 **{tag}**\n\n"
-            f"👤 **User:** [{full_name}](tg://user?id={user_id})\n"
+            "🆕 **#NEW_USER_STARTED**\n\n"
+            f"👤 **Name:** [{full_name}](tg://user?id={user_id})\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"🔗 **Username:** {username}\n"
-            f"👥 **Total Registered Users:** `{total_count}`\n"
-            f"📅 **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
+            f"👥 **Total Bot Users:** `{total_count}`\n"
+            f"📅 **Date:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
         )
         await send_to_log_channel(log_msg)
     except Exception as e:
-        print(f"Log Error (User Start): {e}")
+        print(f"Log Error (New User): {e}")
 
 
 async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
@@ -190,7 +200,7 @@ async def get_fsub_invite_link():
         inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=FSUB_CHANNEL_ID))
         return inv.link
     except Exception:
-        return f"https://t.me/c/{str(FSUB_CHANNEL_ID).replace('-100', '')}"
+        return "https://t.me/Aysha_sama"
 
 
 async def check_fsub_membership(user_id: int) -> bool:
@@ -208,7 +218,7 @@ async def check_fsub_membership(user_id: int) -> bool:
         err_str = str(e).lower()
         if "user_not_participant" in err_str:
             return False
-        # Fail open if bot is not admin in fsub channel yet
+        # If bot is not admin in channel, don't block users
         return True
     return True
 
@@ -219,7 +229,7 @@ async def send_fsub_prompt(event, user_id: int):
         channel_link = await get_fsub_invite_link()
         fsub_text = (
             "🔒 **Access Restricted: Join Channel First**\n\n"
-            "Aapko bot use karne ke liye hamare official channel ko join karna zaroori hai.\n\n"
+            "Bot use karne ke liye pehle hamare official channel ko join karein.\n\n"
             "👉 **Neeche button par click karke channel join karein**, phir **'🔄 Try Again'** dabayein."
         )
         buttons = [
@@ -230,7 +240,7 @@ async def send_fsub_prompt(event, user_id: int):
             await event.reply(fsub_text, buttons=buttons)
         else:
             await event.edit(fsub_text, buttons=buttons)
-    except Exception as e:
+    except Exception:
         await send_start_view(event, user_id)
 
 
@@ -243,11 +253,12 @@ async def check_fsub_again_callback(event):
 
         is_member = await check_fsub_membership(user_id)
         if is_member:
-            await event.answer("✅ Channel verification successful! Welcome.", alert=True)
+            await event.answer("✅ Verification successful! Welcome.", alert=True)
             await send_start_view(event, user_id)
         else:
             await event.answer("❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", alert=True)
     except Exception as e:
+        print(f"Error check_fsub_again: {e}")
         await send_start_view(event, event.sender_id)
 
 
@@ -302,24 +313,22 @@ async def start_handler(event: Message):
         if is_banned(sender_id):
             return await event.reply("⛔ You are banned from using this bot.")
 
-        # Log User Start Event (New user or returning)
-        is_new_user = (sender_id not in known_users)
-        if is_new_user:
+        # ONLY send log when user starts for the VERY FIRST TIME
+        if sender_id not in known_users:
             known_users.add(sender_id)
             save_json_set(USERS_FILE, known_users)
-
-        # Dispatch log in background
-        asyncio.create_task(log_user_start_event(sender, is_new_user))
+            asyncio.create_task(log_new_user_start(sender))
 
         # Check Force Sub
-        if not await check_fsub_membership(sender_id):
+        is_member = await check_fsub_membership(sender_id)
+        if not is_member:
             return await send_fsub_prompt(event, sender_id)
 
         await send_start_view(event, sender_id)
     except Exception as e:
         print(f"Error in start_handler: {e}")
         try:
-            await event.reply("💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\nSend or forward your links here to start checking!")
+            await send_start_view(event, event.sender_id)
         except Exception:
             pass
 
@@ -959,17 +968,10 @@ async def main():
     print(f"📢 Log Channel: {LOG_CHANNEL_ID}")
     print(f"🔒 Force Sub Channel: {FSUB_CHANNEL_ID}")
     print("="*60)
-
-    # Send Boot/Online log directly to Log Channel
-    startup_log = (
-        "🟢 **#BOT_STARTED / ONLINE**\n\n"
-        f"🤖 **Bot:** {BOT_USERNAME}\n"
-        f"👥 **Total Registered Users:** `{len(known_users)}`\n"
-        f"📅 **Boot Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n"
-        "🚀 Bot is active and running 24/7!"
-    )
-    asyncio.create_task(send_to_log_channel(startup_log))
-
+    
+    # Send bot startup notification to log channel
+    asyncio.create_task(log_bot_startup())
+    
     await bot_client.run_until_disconnected()
 
 if __name__ == '__main__':
