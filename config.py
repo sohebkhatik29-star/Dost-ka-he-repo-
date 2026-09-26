@@ -11,8 +11,17 @@ API_HASH = os.getenv("API_HASH", "7716785e7c8e83d29591ff749ce11cd6").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8889912983:AAEdEIc_SkwbD6GoHyy7nY9jGVG-Pzb0Lw0").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "8164563807,6814857981,5566977478").strip()
 
-# User Session String (Required by Telegram MTProto to inspect private chat invites without BOT_METHOD_INVALID error)
+# User Session String (Optional for persistent MTProto user engine)
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
+# Channel Configurations
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003966417603"))
+FSUB_CHANNEL_ID = int(os.getenv("FSUB_CHANNEL_ID", "-1004460118699"))
+
+# Branding
+BOT_USERNAME = "@Short_link_08_bot"
+OWNER_USERNAME = "@Aysha_sama"
+DEVELOPER_USERNAME = "@movies_1780"
 
 # Validate API_ID
 try:
