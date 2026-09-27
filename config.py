@@ -57,7 +57,7 @@ def validate_config():
     return True
 
 # Safe delay between checking links (in seconds) to avoid Telegram FloodWait
-CHECK_DELAY = float(os.getenv("CHECK_DELAY", "0.6"))
+CHECK_DELAY = float(os.getenv("CHECK_DELAY", "1.5"))
 
 # Maximum links allowed per batch to keep operations safe and responsive
 MAX_LINKS_PER_BATCH = int(os.getenv("MAX_LINKS_PER_BATCH", "1000"))
