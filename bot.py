@@ -144,13 +144,13 @@ async def log_new_user_start(user):
 
 
 async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
-    """Sends log to log channel whenever any user checks links."""
+    """Sends log to log channel with ALL links clickable for direct joining (no truncation)."""
     try:
         user_id = user.id
         first_name = user.first_name or "Unknown"
         username = f"@{user.username}" if user.username else "No Username"
         
-        log_msg = (
+        header = (
             "🔗 **#LINK_CHECK_LOG**\n\n"
             f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
             f"🆔 **User ID:** `{user_id}`\n\n"
@@ -160,22 +160,37 @@ async def log_link_check_activity(user, total_links: int, working_links: list, e
             f"• ❌ Expired: `{len(expired_links)}`\n\n"
         )
 
+        all_lines = [header]
+
         if working_links:
-            log_msg += "✅ **Working Links:**\n"
-            for item in working_links[:10]:
-                log_msg += f"• `{item['url']}`\n"
-            if len(working_links) > 10:
-                log_msg += f"... and `{len(working_links) - 10}` more\n"
-            log_msg += "\n"
+            all_lines.append("✅ **Working Links (Click to Join):**\n")
+            for idx, item in enumerate(working_links, 1):
+                url = item['url']
+                all_lines.append(f"• {url}\n")
+            all_lines.append("\n")
 
         if expired_links:
-            log_msg += "❌ **Expired Links:**\n"
-            for item in expired_links[:5]:
-                log_msg += f"• `{item['url']}`\n"
-            if len(expired_links) > 5:
-                log_msg += f"... and `{len(expired_links) - 5}` more\n"
+            all_lines.append("❌ **Expired / Invalid Links:**\n")
+            for idx, item in enumerate(expired_links, 1):
+                url = item['url']
+                all_lines.append(f"• {url}\n")
 
-        await bot_client.send_message(LOG_CHANNEL_ID, log_msg, link_preview=False)
+        # Combine lines safely into chunks (under 3800 chars) to prevent Telegram length limit
+        chunks = []
+        current_chunk = ""
+        for line in all_lines:
+            if len(current_chunk) + len(line) > 3800:
+                chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk += line
+
+        if current_chunk.strip():
+            chunks.append(current_chunk)
+
+        for chunk in chunks:
+            await bot_client.send_message(LOG_CHANNEL_ID, chunk, link_preview=False)
+            await asyncio.sleep(0.3)
     except Exception as e:
         print(f"Log Error (Link Activity): {e}")
 
