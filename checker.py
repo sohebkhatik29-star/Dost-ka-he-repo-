@@ -54,7 +54,23 @@ def extract_telegram_links(text: str) -> List[str]:
     found_links = []
     seen = set()
 
-    # Regex search for standard URLs
+    # 1. Handle tg:// URLs (e.g. tg://join?invite=... and tg://resolve?domain=...)
+    tg_invites = re.findall(r'tg://join\?invite=([a-zA-Z0-9_\-]+)', text, re.IGNORECASE)
+    for inv in tg_invites:
+        canonical = f"https://t.me/+{inv}"
+        if canonical not in seen:
+            seen.add(canonical)
+            found_links.append(canonical)
+
+    tg_domains = re.findall(r'tg://resolve\?domain=([a-zA-Z0-9_]{4,32})', text, re.IGNORECASE)
+    for d in tg_domains:
+        if d.lower() not in IGNORED_SYSTEM_PATHS and not d.isdigit():
+            canonical = f"https://t.me/{d}"
+            if canonical not in seen:
+                seen.add(canonical)
+                found_links.append(canonical)
+
+    # 2. Regex search for standard URLs
     url_pattern = re.compile(
         r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/([^\s\n\(\)\[\]\{\}<>"\',;]+)',
         re.IGNORECASE
@@ -99,7 +115,7 @@ def extract_telegram_links(text: str) -> List[str]:
                     seen.add(canonical_url)
                     found_links.append(canonical_url)
 
-    # Extract standalone @usernames
+    # 3. Extract standalone @usernames
     at_matches = re.findall(r'(?:^|[\s\n\(\[\{<])@([a-zA-Z0-9_]{4,32})', text)
     for uname in at_matches:
         if uname.lower() in IGNORED_SYSTEM_PATHS or uname.isdigit():
@@ -110,6 +126,38 @@ def extract_telegram_links(text: str) -> List[str]:
             found_links.append(canonical_url)
 
     return found_links
+
+
+def extract_links_from_message(message) -> List[str]:
+    """
+    Extracts all Telegram links from a Telethon Message object,
+    including plain text, formatted hyperlinks in message.entities (MessageEntityTextUrl),
+    and button URLs.
+    """
+    if not message:
+        return []
+
+    text_parts = []
+    if hasattr(message, 'text') and message.text:
+        text_parts.append(message.text)
+
+    # Check entities (hyperlinks embedded in text like [Click Here](https://t.me/+...))
+    if hasattr(message, 'entities') and message.entities:
+        for ent in message.entities:
+            url = getattr(ent, 'url', None)
+            if url:
+                text_parts.append(url)
+
+    # Check inline buttons
+    if hasattr(message, 'buttons') and message.buttons:
+        for row in message.buttons:
+            for btn in row:
+                url = getattr(btn, 'url', None)
+                if url:
+                    text_parts.append(url)
+
+    combined_text = "\n".join(text_parts)
+    return extract_telegram_links(combined_text)
 
 
 def parse_link(url: str) -> Tuple[str, str]:
@@ -363,7 +411,6 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Waiting {wait_time}s and retrying...")
                 await asyncio.sleep(wait_time + 0.5)
                 continue
-            # If floodwait exceeds limit, mark as expired
             res = {
                 'url': url,
                 'status': 'expired',
@@ -378,7 +425,6 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except BotMethodInvalidError:
-            # When user engine is disconnected, mark private link as expired
             res = {
                 'url': url,
                 'status': 'expired',
