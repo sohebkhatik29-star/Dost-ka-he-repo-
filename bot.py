@@ -203,73 +203,120 @@ async def log_link_check_activity(user, total_links: int, working_links: list, e
 # --- FORCE SUBSCRIBE VERIFICATION ---
 
 FSUB_CONFIG_FILE = "data/fsub_config.json"
+active_fsub_cache = None
 
-def get_active_fsub_id() -> int:
+def get_active_fsub_config() -> dict:
+    global active_fsub_cache
+    if active_fsub_cache is not None:
+        return active_fsub_cache
     if os.path.exists(FSUB_CONFIG_FILE):
         try:
-            with open(FSUB_CONFIG_FILE, "r") as f:
+            with open(FSUB_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return int(data.get("fsub_channel_id", FSUB_CHANNEL_ID))
+                active_fsub_cache = data
+                return data
         except Exception:
             pass
-    return FSUB_CHANNEL_ID
+    active_fsub_cache = {
+        "channel_id": FSUB_CHANNEL_ID,
+        "access_hash": None,
+        "title": "Official Channel",
+        "username": "Aysha_sama",
+        "invite_link": "https://t.me/Aysha_sama",
+        "full_id": FSUB_CHANNEL_ID
+    }
+    return active_fsub_cache
 
-def set_active_fsub_id(channel_id: int, channel_title: str = ""):
+def set_active_fsub_config(channel_id: int, access_hash: int, title: str, username: str = None, invite_link: str = None, full_id: int = None):
+    global active_fsub_cache
+    data = {
+        "channel_id": channel_id,
+        "access_hash": access_hash,
+        "title": title or "Official Channel",
+        "username": username,
+        "invite_link": invite_link or (f"https://t.me/{username}" if username else "https://t.me/Aysha_sama"),
+        "full_id": full_id or channel_id
+    }
+    active_fsub_cache = data
     try:
         os.makedirs("data", exist_ok=True)
-        with open(FSUB_CONFIG_FILE, "w") as f:
-            json.dump({"fsub_channel_id": channel_id, "title": channel_title}, f)
+        with open(FSUB_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
         print(f"Error saving fsub config: {e}")
 
-async def get_fsub_invite_link():
+async def get_fsub_invite_link() -> str:
     """Returns a direct join link for the Force Sub channel."""
-    try:
-        active_id = get_active_fsub_id()
-        chat = await asyncio.wait_for(bot_client.get_entity(active_id), timeout=3.0)
-        if getattr(chat, 'username', None):
-            return f"https://t.me/{chat.username}"
-        inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=chat))
-        return inv.link
-    except Exception:
-        return "https://t.me/Aysha_sama"
+    cfg = get_active_fsub_config()
+    if cfg.get("invite_link"):
+        return cfg["invite_link"]
+    if cfg.get("username"):
+        return f"https://t.me/{cfg['username']}"
+    return "https://t.me/Aysha_sama"
 
 
-async def check_fsub_membership(user_id: int) -> bool:
+async def check_fsub_membership(user_id: int, input_user=None) -> bool:
     """Checks if a user is a member of the Force Sub channel safely."""
     if is_admin(user_id):
         return True
+    
+    cfg = get_active_fsub_config()
+    ch_id = cfg.get("channel_id")
+    if not ch_id:
+        return True
+
+    access_hash = cfg.get("access_hash")
+
     try:
-        active_id = get_active_fsub_id()
-        chat = await asyncio.wait_for(bot_client.get_entity(active_id), timeout=3.0)
-        participant = await asyncio.wait_for(bot_client(functions.channels.GetParticipantRequest(
-            channel=chat,
-            participant=user_id
-        )), timeout=3.0)
-        if participant:
-            return True
-    except Exception as e:
-        err_str = str(e).lower()
-        if "user_not_participant" in err_str:
+        if access_hash:
+            channel_input = types.InputChannel(channel_id=ch_id, access_hash=access_hash)
+        else:
+            channel_input = await bot_client.get_input_entity(ch_id)
+
+        if input_user is None:
+            try:
+                input_user = await bot_client.get_input_entity(user_id)
+            except Exception:
+                input_user = user_id
+
+        participant = await bot_client(functions.channels.GetParticipantRequest(
+            channel=channel_input,
+            participant=input_user
+        ))
+        
+        p_obj = getattr(participant, 'participant', participant)
+        if isinstance(p_obj, (types.ChannelParticipantBanned, types.ChannelParticipantLeft)):
             return False
         return True
-    return True
+    except Exception as e:
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if "usernotparticipant" in err_name or "user_not_participant" in err_msg:
+            return False
+        print(f"FSub check caught for user {user_id}: {err_name} - {e}")
+        return False
 
 
 async def send_fsub_prompt(event, user_id: int):
     """Prompts the user to join the Force Sub channel before using the bot."""
     channel_link = await get_fsub_invite_link()
+    cfg = get_active_fsub_config()
+    channel_title = cfg.get("title", "Official Channel")
+    
     fsub_text = (
         "🔒 **Access Restricted: Join Channel First**\n\n"
-        "Bot use karne ke liye pehle hamare official channel ko join karein.\n\n"
+        f"Bot use karne ke liye pehle hamare channel **{channel_title}** ko join karein.\n\n"
         "👉 **Neeche button par click karke channel join karein**, phir **'🔄 Try Again'** dabayein."
     )
     buttons = [
-        [Button.url("📢 Join Channel", channel_link)],
+        [Button.url(f"📢 Join {channel_title[:25]}", channel_link)],
         [Button.inline("🔄 Try Again", data=b"check_fsub_again")]
     ]
     if isinstance(event, events.CallbackQuery.Event):
-        await event.edit(fsub_text, buttons=buttons)
+        try:
+            await event.edit(fsub_text, buttons=buttons)
+        except Exception:
+            await bot_client.send_message(user_id, fsub_text, buttons=buttons)
     else:
         await event.respond(fsub_text, buttons=buttons)
 
@@ -281,15 +328,20 @@ async def check_fsub_again_callback(event):
         if is_banned(user_id):
             return await event.answer("You are banned from using this bot.", alert=True)
 
-        is_member = await check_fsub_membership(user_id)
+        input_user = await event.get_input_sender()
+        is_member = await check_fsub_membership(user_id, input_user)
         if is_member:
             await event.answer("✅ Verification successful! Welcome.", alert=True)
-            await send_start_view(event, user_id)
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await send_start_view(event, user_id, as_new_message=True)
         else:
             await event.answer("❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", alert=True)
     except Exception as e:
         print(f"Error check_fsub_again: {e}")
-        await send_start_view(event, event.sender_id)
+        await event.answer("❌ Verification failed. Please join the channel first!", alert=True)
 
 
 # --- START & MENU SYSTEM ---
@@ -349,7 +401,8 @@ async def start_handler(event):
             asyncio.create_task(log_new_user_start(sender))
 
     # Check Force Sub
-    is_member = await check_fsub_membership(sender_id)
+    input_user = await event.get_input_sender()
+    is_member = await check_fsub_membership(sender_id, input_user)
     if not is_member:
         return await send_fsub_prompt(event, sender_id)
 
@@ -471,14 +524,8 @@ async def admin_cmd_handler(event):
 
 async def send_admin_panel_view(user_id: int):
     is_user_auth = await ensure_user_client()
-    fsub_id = get_active_fsub_id()
-    fsub_title = f"`{fsub_id}`"
-    try:
-        fsub_entity = await bot_client.get_entity(fsub_id)
-        if getattr(fsub_entity, 'title', None):
-            fsub_title = f"{fsub_entity.title} (`{fsub_id}`)"
-    except Exception:
-        pass
+    cfg = get_active_fsub_config()
+    fsub_title = f"{cfg.get('title', 'Official Channel')} (`{cfg.get('full_id', cfg.get('channel_id'))}`)"
 
     text = (
         "👑 **Admin Control Panel**\n\n"
@@ -552,14 +599,8 @@ async def admin_fsub_panel_callback(event):
     except Exception:
         pass
 
-    fsub_id = get_active_fsub_id()
-    fsub_title = f"`{fsub_id}`"
-    try:
-        chat = await asyncio.wait_for(bot_client.get_entity(fsub_id), timeout=2.0)
-        if getattr(chat, 'title', None):
-            fsub_title = f"{chat.title} (`{fsub_id}`)"
-    except Exception:
-        pass
+    cfg = get_active_fsub_config()
+    fsub_title = f"{cfg.get('title', 'Official Channel')} (`{cfg.get('full_id', cfg.get('channel_id'))}`)"
 
     login_states[sender_id] = {'step': 'awaiting_fsub_forward'}
 
@@ -838,39 +879,34 @@ async def process_password_submission(event, sender_id: int, password_raw: str):
 
 
 async def process_fsub_forward_submission(event, sender_id: int):
-    target_channel_id = None
-    target_title = None
+    channel_entity = None
 
     # Check forward header
     if event.fwd_from:
         from_id = event.fwd_from.from_id
         if from_id:
-            if hasattr(from_id, 'channel_id'):
-                target_channel_id = from_id.channel_id
-            elif hasattr(from_id, 'chat_id'):
-                target_channel_id = from_id.chat_id
-        if not target_channel_id and hasattr(event.fwd_from, 'channel_id') and event.fwd_from.channel_id:
-            target_channel_id = event.fwd_from.channel_id
+            try:
+                channel_entity = await bot_client.get_entity(from_id)
+            except Exception as e:
+                print(f"Error getting entity from fwd_from: {e}")
 
     # If text link or username provided
     text = (event.text or "").strip()
-    if not target_channel_id and text:
-        if "t.me/" in text:
-            m = re.search(r't\.me/([a-zA-Z0-9_\-]+)', text)
+    if not channel_entity and text:
+        clean_text = text
+        if "t.me/" in clean_text:
+            m = re.search(r't\.me/([a-zA-Z0-9_\-]+)', clean_text)
             if m:
-                text = m.group(1).replace("+", "").replace("joinchat/", "")
-        if text.startswith("@"):
-            text = text[1:]
+                clean_text = m.group(1).replace("+", "").replace("joinchat/", "")
+        if clean_text.startswith("@"):
+            clean_text = clean_text[1:]
         try:
-            target_arg = int(text) if (text.startswith("-100") or (text.isdigit() and len(text) > 8)) else text
-            ent = await bot_client.get_entity(target_arg)
-            if hasattr(ent, 'id'):
-                target_channel_id = ent.id
-                target_title = getattr(ent, 'title', None)
-        except Exception:
-            pass
+            target_arg = int(clean_text) if (clean_text.startswith("-100") or (clean_text.isdigit() and len(clean_text) > 8)) else clean_text
+            channel_entity = await bot_client.get_entity(target_arg)
+        except Exception as e:
+            print(f"Error getting entity from text: {e}")
 
-    if not target_channel_id:
+    if not channel_entity or not hasattr(channel_entity, 'id'):
         buttons = [
             [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
             [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
@@ -882,75 +918,84 @@ async def process_fsub_forward_submission(event, sender_id: int):
             buttons=buttons
         )
 
-    # Standardize -100 prefix for supergroups/channels
-    full_channel_id = target_channel_id
-    if not str(full_channel_id).startswith("-100") and str(full_channel_id).isdigit():
-        full_channel_id = int(f"-100{target_channel_id}")
+    channel_id = channel_entity.id
+    access_hash = getattr(channel_entity, 'access_hash', 0)
+    target_title = getattr(channel_entity, 'title', "Official Channel")
+    target_username = getattr(channel_entity, 'username', None)
+    full_channel_id = int(f"-100{channel_id}") if not str(channel_id).startswith("-100") else channel_id
 
+    # Check if bot is ADMIN in this channel
+    is_bot_admin = False
     try:
-        try:
-            channel_entity = await bot_client.get_entity(full_channel_id)
-        except Exception:
-            channel_entity = await bot_client.get_entity(target_channel_id)
-            full_channel_id = getattr(channel_entity, 'id', full_channel_id)
-
-        target_title = getattr(channel_entity, 'title', str(full_channel_id))
-
-        # Check if bot is ADMIN in this channel
-        is_bot_admin = False
-        try:
-            participant = await bot_client(functions.channels.GetParticipantRequest(
-                channel=channel_entity,
-                participant="me"
-            ))
-            p = participant.participant
-            if isinstance(p, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator)):
-                is_bot_admin = True
-        except Exception:
-            is_bot_admin = False
-
-        if not is_bot_admin:
-            login_states.pop(sender_id, None)
-            buttons = [
-                [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
-                [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
-            ]
-            return await event.respond(
-                f"❌ **Error: Bot is NOT an Admin in this channel!**\n\n"
-                f"📢 **Channel:** {target_title}\n"
-                f"🆔 **Channel ID:** `{full_channel_id}`\n\n"
-                f"⚠️ Pehle bot ko is channel me **Admin banayein** (Invite Users / Add Members permission ke sath), phir try karein!",
-                buttons=buttons
-            )
-
-        # Bot is confirmed Admin! Save config
-        set_active_fsub_id(full_channel_id, target_title)
-        login_states.pop(sender_id, None)
-
-        buttons = [
-            [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")],
-            [Button.inline("🏠 Main Menu", data=b"back_to_start_new")]
-        ]
-        await event.respond(
-            f"🎉 **SUCCESS: Force Subscribe Channel Updated!**\n\n"
-            f"📢 **Active Channel:** {target_title}\n"
-            f"🆔 **Channel ID:** `{full_channel_id}`\n"
-            f"🛡️ **Admin Rights:** Verified ✅\n\n"
-            f"🚀 Ab sabhi users ko bot chalane se pehle **{target_title}** channel join karna zaroori hoga!",
-            buttons=buttons
-        )
-
+        if access_hash:
+            chk_input = types.InputChannel(channel_id=channel_id, access_hash=access_hash)
+        else:
+            chk_input = channel_entity
+        participant = await bot_client(functions.channels.GetParticipantRequest(
+            channel=chk_input,
+            participant="me"
+        ))
+        p = getattr(participant, 'participant', participant)
+        if isinstance(p, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator)):
+            is_bot_admin = True
     except Exception as e:
+        print(f"Bot admin check error: {e}")
+        is_bot_admin = False
+
+    if not is_bot_admin:
         login_states.pop(sender_id, None)
         buttons = [
             [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
             [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
         ]
-        await event.respond(
-            f"❌ **Channel connect nahi ho saka:** `{str(e)}`\n\n"
-            "Make sure bot is added to the channel as Admin first!",
+        return await event.respond(
+            f"❌ **Error: Bot is NOT an Admin in this channel!**\n\n"
+            f"📢 **Channel:** {target_title}\n"
+            f"🆔 **Channel ID:** `{full_channel_id}`\n\n"
+            f"⚠️ Pehle bot ko is channel me **Admin banayein** (Invite Users / Add Members permission ke sath), phir try karein!",
             buttons=buttons
         )
+
+    # Bot is confirmed Admin! Generate/Export permanent invite link
+    invite_link = None
+    if target_username:
+        invite_link = f"https://t.me/{target_username}"
+    else:
+        try:
+            if access_hash:
+                input_ch = types.InputChannel(channel_id=channel_id, access_hash=access_hash)
+            else:
+                input_ch = channel_entity
+            exported_inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=input_ch))
+            invite_link = exported_inv.link
+        except Exception as inv_err:
+            print(f"Error exporting invite link: {inv_err}")
+            invite_link = f"https://t.me/c/{channel_id}/1"
+
+    # Save to config file and active cache
+    set_active_fsub_config(
+        channel_id=channel_id,
+        access_hash=access_hash,
+        title=target_title,
+        username=target_username,
+        invite_link=invite_link,
+        full_id=full_channel_id
+    )
+    login_states.pop(sender_id, None)
+
+    buttons = [
+        [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")],
+        [Button.inline("🏠 Main Menu", data=b"back_to_start_new")]
+    ]
+    await event.respond(
+        f"🎉 **SUCCESS: Force Subscribe Channel Updated!**\n\n"
+        f"📢 **Active Channel:** {target_title}\n"
+        f"🆔 **Channel ID:** `{full_channel_id}`\n"
+        f"🔗 **Join Link:** {invite_link}\n"
+        f"🛡️ **Admin Rights:** Verified ✅\n\n"
+        f"🚀 Ab sabhi users ko bot chalane se pehle **{target_title}** channel join karna zaroori hoga!",
+        buttons=buttons
+    )
 
 
 # --- MESSAGE & LINK RECEIVER HANDLER ---
@@ -1005,7 +1050,8 @@ async def message_handler(event):
             return
 
     # Check Force Sub
-    if not await check_fsub_membership(sender_id):
+    input_user = await event.get_input_sender()
+    if not await check_fsub_membership(sender_id, input_user):
         return await send_fsub_prompt(event, sender_id)
 
     # Extract unique links
@@ -1053,7 +1099,8 @@ async def start_check_callback(event):
     if is_banned(sender_id):
         return await event.answer("You are banned from using this bot.", alert=True)
 
-    if not await check_fsub_membership(sender_id):
+    input_user = await event.get_input_sender()
+    if not await check_fsub_membership(sender_id, input_user):
         return await send_fsub_prompt(event, sender_id)
 
     session = user_sessions.get(sender_id)
