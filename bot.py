@@ -516,6 +516,44 @@ async def cancel_login_callback(event):
     await event.edit("❌ Connection cancelled.")
 
 
+@bot_client.on(events.NewMessage(pattern=r'^/session(?:\s+(.+))?$'))
+async def session_cmd_handler(event):
+    global user_client, user_session_str
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return
+
+    session_arg = event.pattern_match.group(1)
+    if not session_arg:
+        return await event.respond(
+            "🔑 **Connect Engine via StringSession (Instant, No OTP)**\n\n"
+            "Usage: `/session <STRING_SESSION>`\n\n"
+            "💡 Telethon StringSession yahan paste karein aur bina OTP ke engine turant connect ho jayega!"
+        )
+
+    clean_str = session_arg.strip()
+    await event.respond("⏳ Connecting StringSession...")
+    try:
+        new_client = TelegramClient(StringSession(clean_str), API_ID, API_HASH)
+        await new_client.connect()
+        if await new_client.is_user_authorized():
+            user_client = new_client
+            user_session_str = clean_str
+            with open(SAVED_SESSION_FILE, "w") as f:
+                f.write(clean_str)
+            me = await new_client.get_me()
+            first_name = getattr(me, 'first_name', 'Account')
+            await event.respond(
+                f"🎉 **SUCCESS: Engine Connected!**\n\n"
+                f"👤 Logged in as: **{first_name}**\n"
+                "✅ Private invite links (`t.me/+...`) ab 100% active check honge sabhi users ke liye!"
+            )
+        else:
+            await event.respond("❌ That StringSession is invalid or expired.")
+    except Exception as e:
+        await event.respond(f"❌ Failed to connect StringSession: `{e}`")
+
+
 @bot_client.on(events.NewMessage(pattern=r'^/login(?:\s+(.+))?$'))
 async def login_cmd_handler(event):
     sender_id = event.sender_id
