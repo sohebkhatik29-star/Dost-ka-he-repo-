@@ -202,10 +202,31 @@ async def log_link_check_activity(user, total_links: int, working_links: list, e
 
 # --- FORCE SUBSCRIBE VERIFICATION ---
 
+FSUB_CONFIG_FILE = "data/fsub_config.json"
+
+def get_active_fsub_id() -> int:
+    if os.path.exists(FSUB_CONFIG_FILE):
+        try:
+            with open(FSUB_CONFIG_FILE, "r") as f:
+                data = json.load(f)
+                return int(data.get("fsub_channel_id", FSUB_CHANNEL_ID))
+        except Exception:
+            pass
+    return FSUB_CHANNEL_ID
+
+def set_active_fsub_id(channel_id: int, channel_title: str = ""):
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(FSUB_CONFIG_FILE, "w") as f:
+            json.dump({"fsub_channel_id": channel_id, "title": channel_title}, f)
+    except Exception as e:
+        print(f"Error saving fsub config: {e}")
+
 async def get_fsub_invite_link():
     """Returns a direct join link for the Force Sub channel."""
     try:
-        chat = await asyncio.wait_for(bot_client.get_entity(FSUB_CHANNEL_ID), timeout=2.0)
+        active_id = get_active_fsub_id()
+        chat = await asyncio.wait_for(bot_client.get_entity(active_id), timeout=3.0)
         if getattr(chat, 'username', None):
             return f"https://t.me/{chat.username}"
         inv = await bot_client(functions.messages.ExportChatInviteRequest(peer=chat))
@@ -219,11 +240,12 @@ async def check_fsub_membership(user_id: int) -> bool:
     if is_admin(user_id):
         return True
     try:
-        chat = await asyncio.wait_for(bot_client.get_entity(FSUB_CHANNEL_ID), timeout=2.0)
+        active_id = get_active_fsub_id()
+        chat = await asyncio.wait_for(bot_client.get_entity(active_id), timeout=3.0)
         participant = await asyncio.wait_for(bot_client(functions.channels.GetParticipantRequest(
             channel=chat,
             participant=user_id
-        )), timeout=2.0)
+        )), timeout=3.0)
         if participant:
             return True
     except Exception as e:
@@ -272,9 +294,8 @@ async def check_fsub_again_callback(event):
 
 # --- START & MENU SYSTEM ---
 
-async def send_start_view(target, user_id: int):
+async def send_start_view(target, user_id: int, as_new_message: bool = False):
     admin_user = is_admin(user_id)
-    is_logged_in = await ensure_user_client()
 
     welcome_text = (
         "💎 **Welcome to Telegram Bulk Invite Link Checker Bot**\n\n"
@@ -289,23 +310,21 @@ async def send_start_view(target, user_id: int):
         "Simply send or forward any message containing Telegram links here!"
     )
     
-    buttons = []
+    buttons = [
+        [
+            Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
+            Button.inline("📖 About Bot", data=b"menu_about")
+        ],
+        [Button.inline("⚙️ Bot Status", data=b"menu_status")]
+    ]
     
-    if admin_user and not is_logged_in:
-        buttons.append([Button.inline("🔑 Admin: Connect Engine (1-Click)", data=b"start_login_flow")])
-    
-    buttons.append([
-        Button.inline("ℹ️ Help / How to Use", data=b"menu_help"),
-        Button.inline("📖 About Bot", data=b"menu_about")
-    ])
-    
-    row2 = [Button.inline("⚙️ Bot Status", data=b"menu_status")]
     if admin_user:
-        row2.append(Button.inline("🛡️ Admin Panel", data=b"menu_admin_stats"))
-    buttons.append(row2)
+        buttons.append([Button.inline("👑 Admin Panel", data=b"menu_admin_panel")])
 
     try:
-        if isinstance(target, events.CallbackQuery.Event):
+        if as_new_message:
+            await bot_client.send_message(user_id, welcome_text, buttons=buttons)
+        elif isinstance(target, events.CallbackQuery.Event):
             await target.edit(welcome_text, buttons=buttons)
         else:
             await target.respond(welcome_text, buttons=buttons)
@@ -430,31 +449,140 @@ async def status_callback(event):
     await event.edit(status_text, buttons=buttons)
 
 
-@bot_client.on(events.CallbackQuery(data=b"menu_admin_stats"))
-async def admin_stats_callback(event):
-    if not is_admin(event.sender_id):
+@bot_client.on(events.CallbackQuery(data=b"menu_admin_panel"))
+async def admin_panel_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("⚠️ Access Denied: Admin only.", alert=True)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    await send_admin_panel_view(sender_id)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^/admin(?:\s+.*)?$'))
+async def admin_cmd_handler(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return
+    await send_admin_panel_view(sender_id)
+
+
+async def send_admin_panel_view(user_id: int):
+    is_user_auth = await ensure_user_client()
+    fsub_id = get_active_fsub_id()
+    fsub_title = f"`{fsub_id}`"
+    try:
+        fsub_entity = await bot_client.get_entity(fsub_id)
+        if getattr(fsub_entity, 'title', None):
+            fsub_title = f"{fsub_entity.title} (`{fsub_id}`)"
+    except Exception:
+        pass
+
+    text = (
+        "👑 **Admin Control Panel**\n\n"
+        f"👥 **Total Users:** `{len(known_users)}`\n"
+        f"🔑 **Engine Status:** `{'🟢 Connected' if is_user_auth else '🔴 Disconnected'}`\n"
+        f"📢 **Current Force Sub:** {fsub_title}\n\n"
+        "👉 **Manage karne ke liye neeche button dabayein:**"
+    )
+    buttons = [
+        [Button.inline("🔑 Admin Account Engine", data=b"admin_engine_panel")],
+        [Button.inline("📢 Force Sub Channel", data=b"admin_fsub_panel")],
+        [Button.inline("⬅️ Back to Menu", data=b"back_to_start_new")]
+    ]
+    await bot_client.send_message(user_id, text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"admin_engine_panel"))
+async def admin_engine_panel_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
         return await event.answer("Access Denied", alert=True)
+    try:
+        await event.delete()
+    except Exception:
+        pass
 
     is_user_auth = await ensure_user_client()
-    stats_text = (
-        "📊 **Admin Control Panel & Statistics:**\n\n"
-        f"👥 **Total Unique Users:** `{len(known_users)}`\n"
-        f"⛔ **Banned Users:** `{len(banned_users)}`\n"
-        f"👑 **Admins:** `{len(ADMIN_IDS)}`\n"
-        f"🔑 **Engine Status:** `{'🟢 Connected' if is_user_auth else '🟡 Disconnected'}`\n"
-        f"📢 **Log Channel:** `{LOG_CHANNEL_ID}`\n"
-        f"🔒 **Force Sub Channel:** `{FSUB_CHANNEL_ID}`\n\n"
-        "🛠️ **Admin Commands:**\n"
-        "• `/ban <user_id>` — Ban a user\n"
-        "• `/unban <user_id>` — Unban a user\n"
-        "• `/banned` — View banned list\n"
-        "• `/login` — Connect engine"
+    status_str = "🟢 Connected & Active" if is_user_auth else "🔴 Disconnected"
+
+    text = (
+        "🔑 **Admin Account Engine (MTProto)**\n\n"
+        f"⚡ **Engine Status:** `{status_str}`\n\n"
+        "Ye engine private invite links (`t.me/+...`) ko 100% speed aur accuracy se verify karta hai.\n\n"
+        "👉 **Aap jab chahein apna Phone Number connect ya change kar sakte hain:**"
     )
-    buttons = []
-    if not is_user_auth:
-        buttons.append([Button.inline("🔑 Connect Engine", data=b"start_login_flow")])
-    buttons.append([Button.inline("⬅️ Back to Menu", data=b"back_to_start")])
-    await event.edit(stats_text, buttons=buttons)
+    buttons = [
+        [Button.inline("📱 Change / Connect Phone Number", data=b"start_login_flow_new")],
+        [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
+    ]
+    await bot_client.send_message(sender_id, text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"start_login_flow_new"))
+async def start_login_flow_new_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Access Denied", alert=True)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    login_states[sender_id] = {'step': 'awaiting_phone'}
+    prompt_text = (
+        "📱 **Connect / Change Phone Number**\n\n"
+        "👉 **Apna naya Phone Number reply karein** (Country code ke sath):\n\n"
+        "Example: `+919876543210`\n\n"
+        "*(Ya `/session <StringSession>` bhej kar direct session login karein)*"
+    )
+    buttons = [[Button.inline("❌ Cancel", data=b"admin_engine_panel")]]
+    await bot_client.send_message(sender_id, prompt_text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"admin_fsub_panel"))
+async def admin_fsub_panel_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Access Denied", alert=True)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    fsub_id = get_active_fsub_id()
+    fsub_title = f"`{fsub_id}`"
+    try:
+        chat = await asyncio.wait_for(bot_client.get_entity(fsub_id), timeout=2.0)
+        if getattr(chat, 'title', None):
+            fsub_title = f"{chat.title} (`{fsub_id}`)"
+    except Exception:
+        pass
+
+    login_states[sender_id] = {'step': 'awaiting_fsub_forward'}
+
+    text = (
+        "📢 **Force Subscribe Channel Setup**\n\n"
+        f"📌 **Active Channel:** {fsub_title}\n\n"
+        "👉 **Apne target channel se koi bhi message yahan FORWARD karein** (ya channel ka @username / ID bhejein).\n\n"
+        "⚠️ **Zaroori Shart:** Bot ka us channel me **Admin** hona laazmi hai! Agar bot admin nahi hoga toh error aayega."
+    )
+    buttons = [
+        [Button.inline("❌ Cancel", data=b"menu_admin_panel")]
+    ]
+    await bot_client.send_message(sender_id, text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"back_to_start_new"))
+async def back_to_start_new_callback(event):
+    sender_id = event.sender_id
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    await send_start_view(event, sender_id, as_new_message=True)
 
 
 # --- ADMIN BAN & UNBAN COMMANDS ---
@@ -709,6 +837,122 @@ async def process_password_submission(event, sender_id: int, password_raw: str):
         return True
 
 
+async def process_fsub_forward_submission(event, sender_id: int):
+    target_channel_id = None
+    target_title = None
+
+    # Check forward header
+    if event.fwd_from:
+        from_id = event.fwd_from.from_id
+        if from_id:
+            if hasattr(from_id, 'channel_id'):
+                target_channel_id = from_id.channel_id
+            elif hasattr(from_id, 'chat_id'):
+                target_channel_id = from_id.chat_id
+        if not target_channel_id and hasattr(event.fwd_from, 'channel_id') and event.fwd_from.channel_id:
+            target_channel_id = event.fwd_from.channel_id
+
+    # If text link or username provided
+    text = (event.text or "").strip()
+    if not target_channel_id and text:
+        if "t.me/" in text:
+            m = re.search(r't\.me/([a-zA-Z0-9_\-]+)', text)
+            if m:
+                text = m.group(1).replace("+", "").replace("joinchat/", "")
+        if text.startswith("@"):
+            text = text[1:]
+        try:
+            target_arg = int(text) if (text.startswith("-100") or (text.isdigit() and len(text) > 8)) else text
+            ent = await bot_client.get_entity(target_arg)
+            if hasattr(ent, 'id'):
+                target_channel_id = ent.id
+                target_title = getattr(ent, 'title', None)
+        except Exception:
+            pass
+
+    if not target_channel_id:
+        buttons = [
+            [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
+            [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
+        ]
+        return await event.respond(
+            "⚠️ **Channel detect nahi hua!**\n\n"
+            "Channel se seedha **koi bhi message FORWARD karein** ya channel ka link/username (`@channel`) bhejien.\n\n"
+            "*(Make sure forwarded message me channel ka naam show ho raha ho)*",
+            buttons=buttons
+        )
+
+    # Standardize -100 prefix for supergroups/channels
+    full_channel_id = target_channel_id
+    if not str(full_channel_id).startswith("-100") and str(full_channel_id).isdigit():
+        full_channel_id = int(f"-100{target_channel_id}")
+
+    try:
+        try:
+            channel_entity = await bot_client.get_entity(full_channel_id)
+        except Exception:
+            channel_entity = await bot_client.get_entity(target_channel_id)
+            full_channel_id = getattr(channel_entity, 'id', full_channel_id)
+
+        target_title = getattr(channel_entity, 'title', str(full_channel_id))
+
+        # Check if bot is ADMIN in this channel
+        is_bot_admin = False
+        try:
+            participant = await bot_client(functions.channels.GetParticipantRequest(
+                channel=channel_entity,
+                participant="me"
+            ))
+            p = participant.participant
+            if isinstance(p, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator)):
+                is_bot_admin = True
+        except Exception:
+            is_bot_admin = False
+
+        if not is_bot_admin:
+            login_states.pop(sender_id, None)
+            buttons = [
+                [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
+                [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
+            ]
+            return await event.respond(
+                f"❌ **Error: Bot is NOT an Admin in this channel!**\n\n"
+                f"📢 **Channel:** {target_title}\n"
+                f"🆔 **Channel ID:** `{full_channel_id}`\n\n"
+                f"⚠️ Pehle bot ko is channel me **Admin banayein** (Invite Users / Add Members permission ke sath), phir try karein!",
+                buttons=buttons
+            )
+
+        # Bot is confirmed Admin! Save config
+        set_active_fsub_id(full_channel_id, target_title)
+        login_states.pop(sender_id, None)
+
+        buttons = [
+            [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")],
+            [Button.inline("🏠 Main Menu", data=b"back_to_start_new")]
+        ]
+        await event.respond(
+            f"🎉 **SUCCESS: Force Subscribe Channel Updated!**\n\n"
+            f"📢 **Active Channel:** {target_title}\n"
+            f"🆔 **Channel ID:** `{full_channel_id}`\n"
+            f"🛡️ **Admin Rights:** Verified ✅\n\n"
+            f"🚀 Ab sabhi users ko bot chalane se pehle **{target_title}** channel join karna zaroori hoga!",
+            buttons=buttons
+        )
+
+    except Exception as e:
+        login_states.pop(sender_id, None)
+        buttons = [
+            [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
+            [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
+        ]
+        await event.respond(
+            f"❌ **Channel connect nahi ho saka:** `{str(e)}`\n\n"
+            "Make sure bot is added to the channel as Admin first!",
+            buttons=buttons
+        )
+
+
 # --- MESSAGE & LINK RECEIVER HANDLER ---
 
 @bot_client.on(events.NewMessage)
@@ -717,27 +961,35 @@ async def message_handler(event):
     if is_banned(sender_id):
         return
 
-    text_content = (event.text or "").strip()
-    if not text_content:
-        return
-
-    # Check admin login state
+    # Check admin panel states first
     if is_admin(sender_id):
         state = login_states.get(sender_id)
         if state:
             step = state.get('step')
-            if step == 'awaiting_phone':
-                await process_phone_submission(event, sender_id, text_content)
+            if step == 'awaiting_fsub_forward':
+                await process_fsub_forward_submission(event, sender_id)
+                return
+            elif step == 'awaiting_phone':
+                text_content = (event.text or "").strip()
+                if text_content:
+                    await process_phone_submission(event, sender_id, text_content)
                 return
             elif step == 'awaiting_otp':
-                otp_cleaned = text_content.replace('/otp', '').strip()
-                if otp_cleaned.isdigit() or len(otp_cleaned) in (5, 6):
+                text_content = (event.text or "").strip()
+                if text_content:
+                    otp_cleaned = text_content.replace('/otp', '').strip()
                     await process_otp_submission(event, sender_id, otp_cleaned)
-                    return
-            elif step == 'awaiting_password':
-                pwd_cleaned = text_content.replace('/password', '').strip()
-                await process_password_submission(event, sender_id, pwd_cleaned)
                 return
+            elif step == 'awaiting_password':
+                text_content = (event.text or "").strip()
+                if text_content:
+                    pwd_cleaned = text_content.replace('/password', '').strip()
+                    await process_password_submission(event, sender_id, pwd_cleaned)
+                return
+
+    text_content = (event.text or "").strip()
+    if not text_content:
+        return
 
     # Ignore commands
     if text_content.startswith('/'):
