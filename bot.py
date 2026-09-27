@@ -1198,8 +1198,6 @@ async def start_check_callback(event):
 
     working_list = []
     expired_list = []
-    restricted_list = []
-    error_list = []
     last_update_time = time.time()
 
     for idx, url in enumerate(links, start=1):
@@ -1208,12 +1206,8 @@ async def start_check_callback(event):
         status = res.get('status')
         if status == 'working':
             working_list.append(res)
-        elif status == 'expired':
-            expired_list.append(res)
-        elif status == 'restricted':
-            restricted_list.append(res)
         else:
-            error_list.append(res)
+            expired_list.append(res)
 
         current_time = time.time()
         is_last = (idx == total_count)
@@ -1223,14 +1217,9 @@ async def start_check_callback(event):
                     f"🔍 **Checking Links in Progress...**\n\n"
                     f"**Progress:** `{idx} / {total_count}` (`{int((idx/total_count)*100)}%`)\n\n"
                     f"✅ **Working:** `{len(working_list)}`\n"
-                    f"❌ **Expired / Invalid:** `{len(expired_list)}`\n"
+                    f"❌ **Expired / Invalid:** `{len(expired_list)}`\n\n"
+                    f"⏳ *Please wait while MTProto validates links safely...*"
                 )
-                if restricted_list:
-                    progress_text += f"🚫 **Restricted (TOS):** `{len(restricted_list)}`\n"
-                if error_list:
-                    progress_text += f"⚠️ **Could Not Check:** `{len(error_list)}`\n"
-
-                progress_text += "\n⏳ *Please wait while MTProto validates links safely...*"
                 await event.edit(progress_text)
                 last_update_time = current_time
             except Exception:
@@ -1242,9 +1231,7 @@ async def start_check_callback(event):
     job['results'] = {
         'total': total_count,
         'working': working_list,
-        'expired': expired_list,
-        'restricted': restricted_list,
-        'error': error_list
+        'expired': expired_list
     }
 
     # Dispatch Activity Log to Log Channel
@@ -1260,16 +1247,9 @@ async def start_check_callback(event):
         "📊 **Statistics:**\n"
         f"• **Total Links:** `{total_count}`\n"
         f"• ✅ **Working Links:** `{len(working_list)}` ({working_pct:.1f}%)\n"
-        f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n"
+        f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n\n"
+        "**Choose how to receive working links:**"
     )
-    if restricted_list:
-        restricted_pct = (len(restricted_list) / total_count * 100)
-        summary_text += f"• 🚫 **Restricted (TOS):** `{len(restricted_list)}` ({restricted_pct:.1f}%)\n"
-    if error_list:
-        error_pct = (len(error_list) / total_count * 100)
-        summary_text += f"• ⚠️ **Could Not Check:** `{len(error_list)}` ({error_pct:.1f}%)\n"
-
-    summary_text += "\n**Choose how to receive working links:**"
 
     result_buttons = [
         [Button.inline(f"📋 Get as Text ({len(working_list)})", data=f"chk_text:{job_id}".encode())],
