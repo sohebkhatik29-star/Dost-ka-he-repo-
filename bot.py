@@ -23,7 +23,7 @@ from config import (
     FSUB_CHANNEL_ID,
     validate_config
 )
-from checker import extract_telegram_links, check_single_link, parse_link
+from checker import extract_telegram_links, extract_links_from_message, check_single_link, parse_link
 
 if not validate_config():
     print("❌ Cannot start bot. Please verify your environment variables.")
@@ -113,10 +113,11 @@ async def ensure_user_client():
     if user_client:
         try:
             if not user_client.is_connected():
-                await asyncio.wait_for(user_client.connect(), timeout=2.0)
-            if await asyncio.wait_for(user_client.is_user_authorized(), timeout=2.0):
+                await asyncio.wait_for(user_client.connect(), timeout=6.0)
+            if await asyncio.wait_for(user_client.is_user_authorized(), timeout=6.0):
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"ensure_user_client notice: {e}")
             return False
     return False
 
@@ -1073,8 +1074,20 @@ async def message_handler(event):
     if not await check_fsub_membership(sender_id, input_user):
         return await send_fsub_prompt(event, sender_id)
 
-    # Extract unique links
-    links = extract_telegram_links(text_content)
+    # Extract unique links from message text, formatted hyperlinks (entities), and buttons
+    links = extract_links_from_message(event.message)
+    if not links and text_content:
+        links = extract_telegram_links(text_content)
+
+    # If still no links, check if user replied to another message containing links
+    if not links and event.is_reply:
+        try:
+            reply_msg = await event.get_reply_message()
+            if reply_msg:
+                links = extract_links_from_message(reply_msg)
+        except Exception:
+            pass
+
     if not links:
         return
 
@@ -1139,14 +1152,13 @@ async def start_check_callback(event):
     if not job or not job.get('pending_links'):
         try:
             msg = await event.get_message()
-            text_to_scan = ""
+            extracted = []
             if msg:
-                text_to_scan = msg.text or ""
-                if msg.is_reply:
+                extracted = extract_links_from_message(msg)
+                if not extracted and msg.is_reply:
                     reply_msg = await msg.get_reply_message()
-                    if reply_msg and reply_msg.text:
-                        text_to_scan += "\n" + reply_msg.text
-            extracted = extract_telegram_links(text_to_scan)
+                    if reply_msg:
+                        extracted = extract_links_from_message(reply_msg)
             if extracted:
                 job_id = create_checking_job(sender_id, extracted)
                 job = active_jobs[job_id]
