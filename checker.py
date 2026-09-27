@@ -14,11 +14,18 @@ from telethon.errors import (
     BotMethodInvalidError,
     RPCError,
 )
-from config import CHECK_DELAY
 
-# Persistent link verification cache (to avoid duplicate checks and FloodWait)
+# Persistent link verification cache (to avoid duplicate MTProto requests)
 LINK_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 7200  # 2 hours
+CACHE_TTL = 3600  # 1 hour cache TTL
+
+# Non-chat Telegram system paths to ignore
+IGNORED_SYSTEM_PATHS = {
+    'c', 's', 'share', 'iv', 'proxy', 'socks', 'addstickers',
+    'addemoji', 'addtheme', 'invoice', 'boost', 'setlanguage',
+    'login', 'passport', 'terms', 'privacy'
+}
+
 
 def get_cached_result(url: str) -> Dict[str, Any]:
     cached = LINK_CACHE.get(url)
@@ -28,6 +35,7 @@ def get_cached_result(url: str) -> Dict[str, Any]:
         return res
     return None
 
+
 def set_cached_result(url: str, res: Dict[str, Any]):
     if res and res.get('status') in ('working', 'expired', 'restricted'):
         copy_res = dict(res)
@@ -35,103 +43,121 @@ def set_cached_result(url: str, res: Dict[str, Any]):
         LINK_CACHE[url] = copy_res
 
 
-def normalize_telegram_link(url: str) -> str:
-    """
-    Normalizes Telegram links to a standard canonical URL format.
-    - Strips query params, trailing slashes, punctuation
-    - Converts joinchat/HASH to +HASH
-    - Preserves case of private invite hashes (case-sensitive)
-    - Lowercases public usernames (case-insensitive)
-    """
-    clean = url.strip().rstrip('.,;:!?"\')]}')
-    if not clean.startswith('http://') and not clean.startswith('https://'):
-        clean = 'https://' + clean
-
-    clean = re.sub(r'https?://(?:www\.)?telegram\.(?:me|dog)/', 'https://t.me/', clean)
-    clean = re.sub(r'https?://(?:www\.)?t\.me/', 'https://t.me/', clean)
-
-    # Strip query parameters (?start=..., ?boost=...)
-    clean = clean.split('?')[0].split('#')[0].rstrip('/')
-
-    # Standardize joinchat/ -> +
-    if 't.me/joinchat/' in clean:
-        clean = clean.replace('t.me/joinchat/', 't.me/+')
-
-    # If it's a public link (t.me/username), lowercase the username part
-    m = re.match(r'^https://t\.me/([a-zA-Z0-9_]{4,})$', clean)
-    if m:
-        username = m.group(1).lower()
-        clean = f'https://t.me/{username}'
-
-    return clean
-
-
 def extract_telegram_links(text: str) -> List[str]:
     """
-    Extracts all unique Telegram invite and chat links from a raw text message.
-    Preserves unique order and strictly deduplicates exact matches.
+    Extracts and normalizes all unique Telegram invite and chat links from raw text.
+    Preserves exact order and removes only true identical duplicates.
     """
     if not text:
         return []
-    
+
     found_links = []
     seen = set()
-    
-    # Match full URLs and bare domain mentions
-    pattern = r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog))/(?:joinchat/|\+)?[a-zA-Z0-9_\-]+'
-    matches = re.findall(pattern, text)
-    
-    for raw_url in matches:
-        norm = normalize_telegram_link(raw_url)
-        
-        # Filter out internal message links or empty root domains
-        if '/c/' in norm or '/s/' in norm or norm.endswith('t.me') or norm.endswith('t.me/'):
-            continue
-            
-        # Ensure it actually has an identifier
-        parsed_type, identifier = parse_link(norm)
-        if parsed_type == 'unknown' or not identifier:
+
+    # Match http/https telegram links and simple t.me / telegram.me links
+    patterns = [
+        r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/(?:joinchat/|\+)?([a-zA-Z0-9_\-]+[a-zA-Z0-9_])',
+        r'(?:^|[\s\n\(\[\{<])@([a-zA-Z0-9_]{4,32})'
+    ]
+
+    # 1. Regex search for standard URLs
+    url_pattern = re.compile(
+        r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/([^\s\n\(\)\[\]\{\}<>"\',;]+)',
+        re.IGNORECASE
+    )
+
+    for match in url_pattern.finditer(text):
+        raw_path = match.group(1).strip().rstrip('.,;:!?"\')]}')
+        if not raw_path:
             continue
 
-        if norm not in seen:
-            seen.add(norm)
-            found_links.append(norm)
-            
+        # Handle query params if present (e.g. ?start=...)
+        clean_path = raw_path.split('?')[0].split('#')[0].strip('/')
+        if not clean_path:
+            continue
+
+        # Check for system routes
+        path_first_part = clean_path.split('/')[0].lower()
+        if path_first_part in IGNORED_SYSTEM_PATHS:
+            continue
+
+        # Private invite: +hash or joinchat/hash
+        if clean_path.startswith('+'):
+            invite_hash = clean_path[1:]
+            if re.match(r'^[a-zA-Z0-9_\-]+$', invite_hash) and len(invite_hash) >= 4:
+                canonical_url = f"https://t.me/+{invite_hash}"
+                if canonical_url not in seen:
+                    seen.add(canonical_url)
+                    found_links.append(canonical_url)
+        elif clean_path.startswith('joinchat/'):
+            invite_hash = clean_path[len('joinchat/'):]
+            if re.match(r'^[a-zA-Z0-9_\-]+$', invite_hash) and len(invite_hash) >= 4:
+                canonical_url = f"https://t.me/+{invite_hash}"
+                if canonical_url not in seen:
+                    seen.add(canonical_url)
+                    found_links.append(canonical_url)
+        else:
+            # Public username
+            username = clean_path.split('/')[0]
+            if re.match(r'^[a-zA-Z0-9_]{4,32}$', username) and not username.isdigit():
+                canonical_url = f"https://t.me/{username}"
+                if canonical_url not in seen:
+                    seen.add(canonical_url)
+                    found_links.append(canonical_url)
+
+    # 2. Extract standalone @usernames
+    at_matches = re.findall(r'(?:^|[\s\n\(\[\{<])@([a-zA-Z0-9_]{4,32})', text)
+    for uname in at_matches:
+        if uname.lower() in IGNORED_SYSTEM_PATHS or uname.isdigit():
+            continue
+        canonical_url = f"https://t.me/{uname}"
+        if canonical_url not in seen:
+            seen.add(canonical_url)
+            found_links.append(canonical_url)
+
     return found_links
 
 
 def parse_link(url: str) -> Tuple[str, str]:
     """
-    Identifies link type ('invite' vs 'public') and returns identifier.
+    Identifies link type ('invite' vs 'public') and returns the clean identifier/hash.
     """
+    # Private Invite: https://t.me/+hash or https://t.me/joinchat/hash
     invite_match = re.search(r't\.me/(?:\+|joinchat/)([a-zA-Z0-9_\-]+)', url)
     if invite_match:
         return ('invite', invite_match.group(1))
-    
-    public_match = re.search(r't\.me/([a-zA-Z0-9_]{4,})', url)
+
+    # Public Chat: https://t.me/username
+    public_match = re.search(r't\.me/([a-zA-Z0-9_]{4,32})', url)
     if public_match:
-        return ('public', public_match.group(1))
-        
+        uname = public_match.group(1)
+        if uname.lower() not in IGNORED_SYSTEM_PATHS:
+            return ('public', uname)
+
     return ('unknown', url)
 
 
-async def check_single_link(client: TelegramClient, url: str, max_retries: int = 2) -> Dict[str, Any]:
+async def check_single_link(client: TelegramClient, url: str, max_retries: int = 3) -> Dict[str, Any]:
     """
-    Checks the validity of a single Telegram link with retry logic, FloodWait backoff,
-    and accurate status categorization (working, expired, restricted, error).
+    Checks the validity of a single Telegram link using MTProto API.
+    Features:
+    - Multi-stage retry with exponential backoff for temporary/network failures.
+    - Smart FloodWait handling.
+    - Full classification: 'working', 'expired', 'restricted', 'error'.
+    - Complete support for invite links without title/member count (never false negative).
+    - Support for links requiring Admin Approval (request_needed).
     """
-    # Check cache first
     cached = get_cached_result(url)
     if cached:
         return cached
 
     link_type, identifier = parse_link(url)
-    
+
     if link_type == 'unknown':
         res = {
             'url': url,
             'status': 'expired',
-            'reason': 'Invalid link format',
+            'reason': 'Invalid Telegram link format',
             'title': None,
             'members': 0,
             'is_channel': False,
@@ -141,56 +167,40 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
         set_cached_result(url, res)
         return res
 
-    attempt = 0
-    while attempt <= max_retries:
-        attempt += 1
+    for attempt in range(1, max_retries + 1):
         try:
             if link_type == 'invite':
                 # MTProto CheckChatInviteRequest
                 result = await client(functions.messages.CheckChatInviteRequest(hash=identifier))
-                
-                # Check for Terms of Service restriction
-                restricted = getattr(result, 'restricted', False)
-                if restricted:
-                    res = {
-                        'url': url,
-                        'status': 'restricted',
-                        'reason': 'Channel restricted for Terms of Service violation',
-                        'title': getattr(result, 'title', None) or 'Restricted Channel',
-                        'members': (getattr(result, 'participants_count', 0) or 0),
-                        'is_channel': getattr(result, 'channel', False),
-                        'is_group': not getattr(result, 'channel', False),
-                        'request_needed': False
-                    }
-                    set_cached_result(url, res)
-                    return res
 
                 if isinstance(result, types.ChatInvite):
-                    p_count = getattr(result, 'participants_count', 0) or 0
-                    title = getattr(result, 'title', None) or 'Private Chat'
+                    title = getattr(result, 'title', None) or 'Telegram Private Chat'
+                    participants = getattr(result, 'participants_count', 0) or 0
+                    is_chan = getattr(result, 'channel', False) or getattr(result, 'broadcast', False)
+                    req_needed = getattr(result, 'request_needed', False)
+
                     res = {
                         'url': url,
                         'status': 'working',
-                        'reason': 'Active invite link' + (' (Approval Required)' if getattr(result, 'request_needed', False) else ''),
+                        'reason': 'Active invite link' + (' (Join Request Required)' if req_needed else ''),
                         'title': title,
-                        'members': p_count,
-                        'is_channel': getattr(result, 'channel', False),
-                        'is_group': not getattr(result, 'channel', False),
-                        'request_needed': getattr(result, 'request_needed', False)
+                        'members': participants,
+                        'is_channel': is_chan,
+                        'is_group': not is_chan,
+                        'request_needed': req_needed
                     }
                     set_cached_result(url, res)
                     return res
 
                 elif isinstance(result, types.ChatInviteAlready):
-                    chat = result.chat
-                    restricted_chat = getattr(chat, 'restricted', False)
-                    if restricted_chat:
+                    chat = getattr(result, 'chat', None)
+                    if isinstance(chat, types.ChannelForbidden):
                         res = {
                             'url': url,
                             'status': 'restricted',
                             'reason': 'Channel restricted by Telegram TOS',
-                            'title': getattr(chat, 'title', 'Restricted Chat'),
-                            'members': getattr(chat, 'participants_count', 0) or 0,
+                            'title': getattr(chat, 'title', 'Restricted Channel'),
+                            'members': 0,
                             'is_channel': True,
                             'is_group': False,
                             'request_needed': False
@@ -198,109 +208,117 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         set_cached_result(url, res)
                         return res
 
-                    title = getattr(chat, 'title', None) or 'Active Chat'
-                    participants = getattr(chat, 'participants_count', 0) or 0
+                    title = getattr(chat, 'title', 'Telegram Chat') if chat else 'Active Chat'
+                    participants = getattr(chat, 'participants_count', 0) if chat else 0
+                    is_chan = isinstance(chat, types.Channel) and getattr(chat, 'broadcast', False)
+                    is_grp = isinstance(chat, types.Chat) or (isinstance(chat, types.Channel) and getattr(chat, 'megagroup', False))
+
                     res = {
                         'url': url,
                         'status': 'working',
-                        'reason': 'Active (Already member)',
+                        'reason': 'Active invite link',
                         'title': title,
                         'members': participants,
-                        'is_channel': isinstance(chat, types.Channel) and bool(chat.broadcast),
-                        'is_group': isinstance(chat, types.Chat) or (isinstance(chat, types.Channel) and bool(chat.megagroup)),
+                        'is_channel': is_chan,
+                        'is_group': is_grp or not is_chan,
                         'request_needed': False
                     }
                     set_cached_result(url, res)
                     return res
 
                 elif isinstance(result, types.ChatInvitePeek):
-                    chat = result.chat
-                    title = getattr(chat, 'title', None) or 'Telegram Chat'
-                    participants = getattr(chat, 'participants_count', 0) or 0
+                    chat = getattr(result, 'chat', None)
+                    title = getattr(chat, 'title', 'Telegram Chat') if chat else 'Active Chat'
+                    participants = getattr(chat, 'participants_count', 0) if chat else 0
+                    is_chan = getattr(chat, 'broadcast', False) if chat else False
+
                     res = {
                         'url': url,
                         'status': 'working',
-                        'reason': 'Active invite',
+                        'reason': 'Active invite link',
                         'title': title,
                         'members': participants,
-                        'is_channel': getattr(chat, 'broadcast', False),
-                        'is_group': True,
+                        'is_channel': is_chan,
+                        'is_group': not is_chan,
                         'request_needed': False
                     }
                     set_cached_result(url, res)
                     return res
 
                 else:
+                    # Any other valid ChatInvite object returned by MTProto
                     res = {
                         'url': url,
                         'status': 'working',
-                        'reason': 'Active invite',
-                        'title': 'Telegram Chat',
-                        'members': 0,
+                        'reason': 'Active invite link',
+                        'title': getattr(result, 'title', 'Telegram Chat') or 'Telegram Chat',
+                        'members': getattr(result, 'participants_count', 0) or 0,
                         'is_channel': False,
                         'is_group': True,
                         'request_needed': False
                     }
                     set_cached_result(url, res)
                     return res
-                    
-            elif link_type == 'public':
-                try:
-                    resolved = await client(functions.contacts.ResolveUsernameRequest(username=identifier))
-                    if resolved.chats:
-                        chat = resolved.chats[0]
-                        restricted = getattr(chat, 'restricted', False)
-                        if restricted:
-                            res = {
-                                'url': url,
-                                'status': 'restricted',
-                                'reason': 'Channel restricted by Telegram TOS',
-                                'title': getattr(chat, 'title', identifier),
-                                'members': getattr(chat, 'participants_count', 0) or 0,
-                                'is_channel': True,
-                                'is_group': False,
-                                'request_needed': False
-                            }
-                            set_cached_result(url, res)
-                            return res
 
-                        title = getattr(chat, 'title', None) or identifier
-                        participants = getattr(chat, 'participants_count', 0) or 0
+            elif link_type == 'public':
+                # Use MTProto ResolveUsernameRequest for 100% accuracy on public chats
+                resolved = await client(functions.contacts.ResolveUsernameRequest(username=identifier))
+
+                if resolved.chats:
+                    chat = resolved.chats[0]
+                    if isinstance(chat, types.ChannelForbidden):
                         res = {
                             'url': url,
-                            'status': 'working',
-                            'reason': 'Active public chat',
-                            'title': title,
-                            'members': participants,
-                            'is_channel': isinstance(chat, types.Channel) and bool(chat.broadcast),
-                            'is_group': isinstance(chat, types.Chat) or (isinstance(chat, types.Channel) and bool(chat.megagroup)),
-                            'request_needed': False
-                        }
-                        set_cached_result(url, res)
-                        return res
-                    elif resolved.users:
-                        user = resolved.users[0]
-                        first = getattr(user, 'first_name', '') or ''
-                        last = getattr(user, 'last_name', '') or ''
-                        name = f"{first} {last}".strip() or identifier
-                        res = {
-                            'url': url,
-                            'status': 'working',
-                            'reason': 'User/Bot profile',
-                            'title': name,
-                            'members': 1,
-                            'is_channel': False,
+                            'status': 'restricted',
+                            'reason': 'Channel restricted by Telegram TOS',
+                            'title': getattr(chat, 'title', identifier),
+                            'members': 0,
+                            'is_channel': True,
                             'is_group': False,
                             'request_needed': False
                         }
                         set_cached_result(url, res)
                         return res
-                except (UsernameNotOccupiedError, UsernameInvalidError):
+
+                    title = getattr(chat, 'title', identifier)
+                    participants = getattr(chat, 'participants_count', 0) or 0
+                    is_chan = getattr(chat, 'broadcast', False)
+                    is_grp = getattr(chat, 'megagroup', False) or isinstance(chat, types.Chat)
+
                     res = {
                         'url': url,
-                        'status': 'expired',
-                        'reason': 'Username does not exist or was released',
-                        'title': None,
+                        'status': 'working',
+                        'reason': 'Active public chat',
+                        'title': title,
+                        'members': participants,
+                        'is_channel': is_chan,
+                        'is_group': is_grp or not is_chan,
+                        'request_needed': False
+                    }
+                    set_cached_result(url, res)
+                    return res
+
+                elif resolved.users:
+                    user = resolved.users[0]
+                    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or identifier
+                    res = {
+                        'url': url,
+                        'status': 'working',
+                        'reason': 'Active user / bot profile',
+                        'title': full_name,
+                        'members': 1,
+                        'is_channel': False,
+                        'is_group': False,
+                        'request_needed': False
+                    }
+                    set_cached_result(url, res)
+                    return res
+                else:
+                    res = {
+                        'url': url,
+                        'status': 'working',
+                        'reason': 'Active public link',
+                        'title': identifier,
                         'members': 0,
                         'is_channel': False,
                         'is_group': False,
@@ -310,7 +328,6 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                     return res
 
         except (InviteHashExpiredError, InviteHashInvalidError):
-            # Definite permanent failure: link expired or revoked
             res = {
                 'url': url,
                 'status': 'expired',
@@ -328,7 +345,7 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             res = {
                 'url': url,
                 'status': 'expired',
-                'reason': 'Username does not exist',
+                'reason': 'Username does not exist or unassigned',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
@@ -339,13 +356,14 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except ChannelPrivateError:
+            # Channel is private or deleted
             res = {
                 'url': url,
-                'status': 'restricted',
-                'reason': 'Private channel or restricted access',
-                'title': 'Private / Restricted Channel',
+                'status': 'expired',
+                'reason': 'Chat is private or inaccessible',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False
             }
@@ -353,31 +371,27 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except FloodWaitError as e:
-            # Telegram FloodWait must be handled with appropriate backoff!
-            wait_time = e.seconds
-            print(f"⚠️ Telegram FloodWait: {wait_time}s required on link {url}")
-            if attempt <= max_retries and wait_time <= 30:
-                print(f"⏳ Waiting {wait_time + 1}s before retrying link...")
-                await asyncio.sleep(wait_time + 1)
+            wait_time = min(e.seconds, 15)
+            if attempt < max_retries and e.seconds <= 20:
+                print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Sleeping {wait_time}s and retrying (attempt {attempt}/{max_retries})...")
+                await asyncio.sleep(wait_time + 0.5)
                 continue
-            else:
-                return {
-                    'url': url,
-                    'status': 'error',
-                    'reason': f'Telegram FloodWait ({wait_time}s cooldown)',
-                    'flood_wait_seconds': wait_time,
-                    'title': None,
-                    'members': 0,
-                    'is_channel': False,
-                    'is_group': False,
-                    'request_needed': False
-                }
+            return {
+                'url': url,
+                'status': 'error',
+                'reason': f'Telegram FloodWait ({e.seconds}s cooldown)',
+                'title': None,
+                'members': 0,
+                'is_channel': False,
+                'is_group': False,
+                'request_needed': False
+            }
 
         except BotMethodInvalidError:
             return {
                 'url': url,
                 'status': 'error',
-                'reason': 'Admin Account Engine disconnected (Re-login required in /admin)',
+                'reason': 'MTProto Engine Disconnected (User account login required for private links)',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
@@ -386,16 +400,14 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             }
 
         except RPCError as e:
-            err_code = getattr(e, 'code', 0)
-            err_msg = getattr(e, 'message', str(e)).upper()
+            err_str = str(e).upper()
             
-            # 1. Definite Working Link indicators in RPC errors:
-            if "INVITE_REQUEST_SENT" in err_msg:
-                # User already sent a join request to this approval-only channel. The link IS WORKING!
+            # 1. Check if join request is pending -> Valid link!
+            if "INVITE_REQUEST_SENT" in err_str:
                 res = {
                     'url': url,
                     'status': 'working',
-                    'reason': 'Active invite link (Join Request Already Sent)',
+                    'reason': 'Active invite (Join request sent)',
                     'title': 'Private Channel (Request Pending)',
                     'members': 0,
                     'is_channel': True,
@@ -405,26 +417,12 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 set_cached_result(url, res)
                 return res
 
-            if "USER_ALREADY_PARTICIPANT" in err_msg:
+            # 2. Check if user is banned in channel -> Invite link itself is valid!
+            if "USER_BANNED_IN_CHANNEL" in err_str:
                 res = {
                     'url': url,
                     'status': 'working',
-                    'reason': 'Active invite (Already a Member)',
-                    'title': 'Active Group / Channel',
-                    'members': 0,
-                    'is_channel': False,
-                    'is_group': True,
-                    'request_needed': False
-                }
-                set_cached_result(url, res)
-                return res
-
-            if any(term in err_msg for term in ("CHANNELS_TOO_MUCH", "USERS_TOO_MUCH", "USER_BANNED_IN_CHANNEL")):
-                # The invite link itself is valid, but the user/group has hit account limits
-                res = {
-                    'url': url,
-                    'status': 'working',
-                    'reason': 'Active invite (Channel/Account capacity limit)',
+                    'reason': 'Active invite link',
                     'title': 'Active Channel',
                     'members': 0,
                     'is_channel': True,
@@ -434,12 +432,12 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 set_cached_result(url, res)
                 return res
 
-            # 2. Definite Restricted / Terms of Service violation:
-            if any(term in err_msg for term in ("CHANNEL_RESTRICTED", "CHAT_RESTRICTED", "USER_RESTRICTED", "BROADCAST_FORBIDDEN")):
+            # 3. Restricted channels (TOS / Copyright)
+            if any(k in err_str for k in ("CHANNEL_RESTRICTED", "CHAT_RESTRICTED", "TERMS_OF_SERVICE", "CHAT_FORBIDDEN")):
                 res = {
                     'url': url,
                     'status': 'restricted',
-                    'reason': 'Channel violated Telegram Terms of Service / Restricted',
+                    'reason': 'Violated Telegram Terms of Service / Restricted',
                     'title': 'Restricted Channel',
                     'members': 0,
                     'is_channel': True,
@@ -449,8 +447,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 set_cached_result(url, res)
                 return res
 
-            # 3. Definite Expired / Invalid invite:
-            if any(term in err_msg for term in ("INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "CHAT_INVALID", "PEER_ID_INVALID")):
+            # 4. Permanent invalid / expired hashes
+            if any(k in err_str for k in ("INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "CHAT_INVALID", "PEER_ID_INVALID")):
                 res = {
                     'url': url,
                     'status': 'expired',
@@ -464,15 +462,15 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 set_cached_result(url, res)
                 return res
 
-            # Temporary server-side error (DC_MIGRATE, RPC_CALL_FAIL, etc.): retry
-            if attempt <= max_retries:
-                await asyncio.sleep(1.0)
+            # 5. Temporary RPC error -> Retry
+            if attempt < max_retries:
+                await asyncio.sleep(1.0 * attempt)
                 continue
-            
+
             return {
                 'url': url,
                 'status': 'error',
-                'reason': f'Telegram Error: {err_msg}',
+                'reason': f'Telegram Error: {str(e)}',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
@@ -481,14 +479,15 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             }
 
         except Exception as e:
-            # Temporary network error / socket timeout: retry
-            if attempt <= max_retries:
-                await asyncio.sleep(1.0)
+            # Network blip / socket error -> Retry
+            if attempt < max_retries:
+                await asyncio.sleep(1.0 * attempt)
                 continue
+
             return {
                 'url': url,
                 'status': 'error',
-                'reason': f'{type(e).__name__}: {str(e)}',
+                'reason': f'Check Error: {str(e)}',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
@@ -496,11 +495,10 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 'request_needed': False
             }
 
-    # Fallback if loop ends
     return {
         'url': url,
         'status': 'error',
-        'reason': 'Verification timed out after retries',
+        'reason': 'Temporary network timeout after retries',
         'title': None,
         'members': 0,
         'is_channel': False,
