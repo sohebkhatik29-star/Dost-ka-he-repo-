@@ -4,6 +4,7 @@ import json
 import asyncio
 import time
 import re
+import uuid
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl import functions, types
@@ -79,6 +80,7 @@ elif os.path.exists('user_session.session'):
 
 # In-memory stores
 user_sessions = {}
+active_jobs = {} # Independent storage for checking jobs by job_id
 login_states = {} # For admin interactive login flow
 
 def is_admin(user_id: int) -> bool:
@@ -94,10 +96,11 @@ async def ensure_user_client():
     if user_client:
         try:
             if not user_client.is_connected():
-                await asyncio.wait_for(user_client.connect(), timeout=2.0)
-            if await asyncio.wait_for(user_client.is_user_authorized(), timeout=2.0):
+                await asyncio.wait_for(user_client.connect(), timeout=5.0)
+            if await asyncio.wait_for(user_client.is_user_authorized(), timeout=5.0):
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"ensure_user_client note: {e}")
             return False
     return False
 
@@ -143,21 +146,28 @@ async def log_new_user_start(user):
         print(f"Log Error (New User): {e}")
 
 
-async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list):
+async def log_link_check_activity(user, total_links: int, working_links: list, expired_links: list, restricted_links: list = None):
     """Sends log to log channel with ALL links with title, members, and clickable join URL."""
     try:
         user_id = user.id
         first_name = user.first_name or "Unknown"
         username = f"@{user.username}" if user.username else "No Username"
+        restricted_links = restricted_links or []
         
+        stat_lines = [
+            f"• Total Links: `{total_links}`",
+            f"• ✅ Working: `{len(working_links)}`",
+            f"• ❌ Expired: `{len(expired_links)}`"
+        ]
+        if restricted_links:
+            stat_lines.append(f"• 🚫 Restricted: `{len(restricted_links)}`")
+
         header = (
             "🔗 **#LINK_CHECK_LOG**\n\n"
             f"👤 **User:** [{first_name}](tg://user?id={user_id}) ({username})\n"
             f"🆔 **User ID:** `{user_id}`\n\n"
             f"📊 **Statistics:**\n"
-            f"• Total Links: `{total_links}`\n"
-            f"• ✅ Working: `{len(working_links)}`\n"
-            f"• ❌ Expired: `{len(expired_links)}`\n\n"
+            + "\n".join(stat_lines) + "\n\n"
         )
 
         all_lines = [header]
@@ -167,11 +177,19 @@ async def log_link_check_activity(user, total_links: int, working_links: list, e
             for item in working_links:
                 url = item['url']
                 title = item.get('title')
-                members = item.get('members', 0)
+                members = item.get('members', 0) or 0
                 if title:
-                    all_lines.append(f"• {title} ({members} members)\n  {url}\n\n")
+                    m_str = f" ({members} members)" if members > 0 else ""
+                    all_lines.append(f"• {title}{m_str}\n  {url}\n\n")
                 else:
                     all_lines.append(f"• {url}\n\n")
+
+        if restricted_links:
+            all_lines.append(f"🚫 **Restricted / TOS Violated ({len(restricted_links)} Total):**\n\n")
+            for item in restricted_links:
+                url = item['url']
+                all_lines.append(f"• {url}\n")
+            all_lines.append("\n")
 
         if expired_links:
             all_lines.append(f"❌ **Expired Links ({len(expired_links)} Total):**\n\n")
@@ -1066,15 +1084,20 @@ async def message_handler(event):
         )
         return
 
-    user_sessions[sender_id] = {
+    job_id = uuid.uuid4().hex[:8]
+    job_data = {
+        'job_id': job_id,
+        'user_id': sender_id,
         'pending_links': links,
         'results': None,
         'started_at': None
     }
+    active_jobs[job_id] = job_data
+    user_sessions[sender_id] = job_data
 
     buttons = [
-        [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=b"start_check")],
-        [Button.inline("❌ Cancel", data=b"cancel_check")]
+        [Button.inline(f"🚀 Start Checking ({len(links)} Links)", data=f"chk_{job_id}".encode())],
+        [Button.inline("❌ Cancel", data=f"ccl_{job_id}".encode())]
     ]
     await event.respond(
         f"🔗 **Detected {len(links)} Unique Telegram Links**\n\n"
@@ -1084,16 +1107,24 @@ async def message_handler(event):
     )
 
 
-# --- CHECKING & PROGRESS WORKFLOW ---
+# --- CHECKING & PROGRESS WORKFLOW (JOB ISOLATED) ---
 
-@bot_client.on(events.CallbackQuery(data=b"cancel_check"))
+@bot_client.on(events.CallbackQuery(pattern=r'^(?:ccl_([a-zA-Z0-9]+)|cancel_check)$'))
 async def cancel_callback(event):
     sender_id = event.sender_id
+    job_id = None
+    if event.pattern_match:
+        try:
+            job_id = event.pattern_match.group(1)
+        except Exception:
+            pass
+    if job_id:
+        active_jobs.pop(job_id, None)
     user_sessions.pop(sender_id, None)
     await event.edit("❌ **Operation Cancelled.** Send new links anytime.")
 
 
-@bot_client.on(events.CallbackQuery(data=b"start_check"))
+@bot_client.on(events.CallbackQuery(pattern=r'^(?:chk_([a-zA-Z0-9]+)|start_check)$'))
 async def start_check_callback(event):
     sender_id = event.sender_id
     if is_banned(sender_id):
@@ -1103,11 +1134,22 @@ async def start_check_callback(event):
     if not await check_fsub_membership(sender_id, input_user):
         return await send_fsub_prompt(event, sender_id)
 
-    session = user_sessions.get(sender_id)
-    if not session or not session.get('pending_links'):
+    job_id = None
+    if event.pattern_match:
+        try:
+            job_id = event.pattern_match.group(1)
+        except Exception:
+            pass
+
+    job = active_jobs.get(job_id) if job_id else user_sessions.get(sender_id)
+    if not job or not job.get('pending_links'):
         return await event.edit("⚠️ No links found in queue. Please send your links again.")
 
-    links = session['pending_links']
+    actual_job_id = job.get('job_id') or job_id or uuid.uuid4().hex[:8]
+    job['job_id'] = actual_job_id
+    active_jobs[actual_job_id] = job
+
+    links = job['pending_links']
     total_count = len(links)
     
     # Check if MTProto engine is connected
@@ -1120,7 +1162,7 @@ async def start_check_callback(event):
         if is_admin(sender_id):
             buttons = [
                 [Button.inline("🔑 Connect Engine Now (1-Click)", data=b"start_login_flow")],
-                [Button.inline("❌ Cancel", data=b"cancel_check")]
+                [Button.inline("❌ Cancel", data=f"ccl_{actual_job_id}".encode())]
             ]
             return await event.edit(
                 "⚠️ **Admin Notice: MTProto Engine Disconnected**\n\n"
@@ -1144,18 +1186,27 @@ async def start_check_callback(event):
 
     working_list = []
     expired_list = []
+    restricted_list = []
     error_list = []
     last_update_time = time.time()
     
     for idx, url in enumerate(links, start=1):
         res = await check_single_link(active_client, url)
         
-        if res['status'] == 'working':
+        status = res.get('status')
+        if status == 'working':
             working_list.append(res)
-        elif res['status'] == 'expired':
+        elif status == 'restricted':
+            restricted_list.append(res)
+        elif status == 'expired':
             expired_list.append(res)
         else:
             error_list.append(res)
+            # If FloodWait occurred, pause safely to protect subsequent links
+            fw = res.get('flood_wait_seconds', 0)
+            if fw and fw > 0:
+                wait_to_pause = min(fw, 12)
+                await asyncio.sleep(wait_to_pause)
 
         current_time = time.time()
         is_last = (idx == total_count)
@@ -1166,9 +1217,12 @@ async def start_check_callback(event):
                     f"**Progress:** `{idx} / {total_count}` (`{int((idx/total_count)*100)}%`)\n\n"
                     f"✅ **Working:** `{len(working_list)}`\n"
                     f"❌ **Expired / Invalid:** `{len(expired_list)}`\n"
-                    f"⚠️ **Could Not Check:** `{len(error_list)}`\n\n"
-                    f"⏳ *Please wait while MTProto validates links safely...*"
                 )
+                if restricted_list:
+                    progress_text += f"🚫 **Restricted / TOS:** `{len(restricted_list)}`\n"
+                if error_list:
+                    progress_text += f"⚠️ **Could Not Check:** `{len(error_list)}`\n"
+                progress_text += f"\n⏳ *Please wait while MTProto validates links safely...*"
                 await event.edit(progress_text)
                 last_update_time = current_time
             except Exception:
@@ -1176,17 +1230,19 @@ async def start_check_callback(event):
 
         await asyncio.sleep(CHECK_DELAY)
 
-    session['results'] = {
+    job['results'] = {
         'total': total_count,
         'working': working_list,
         'expired': expired_list,
+        'restricted': restricted_list,
         'error': error_list
     }
+    user_sessions[sender_id] = job
 
     # Dispatch Activity Log to Log Channel
     sender_obj = await event.get_sender()
     if sender_obj:
-        asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list))
+        asyncio.create_task(log_link_check_activity(sender_obj, total_count, working_list, expired_list, restricted_list))
 
     working_pct = (len(working_list) / total_count * 100) if total_count > 0 else 0
     expired_pct = (len(expired_list) / total_count * 100) if total_count > 0 else 0
@@ -1198,15 +1254,16 @@ async def start_check_callback(event):
         f"• ✅ **Working Links:** `{len(working_list)}` ({working_pct:.1f}%)\n"
         f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n"
     )
-    
+    if restricted_list:
+        summary_text += f"• 🚫 **Restricted / Unavailable:** `{len(restricted_list)}`\n"
     if error_list:
         summary_text += f"• ⚠️ **Could Not Check:** `{len(error_list)}`\n"
 
     summary_text += "\n**Choose how to receive working links:**"
 
     result_buttons = [
-        [Button.inline(f"📋 Get as Text ({len(working_list)})", data=b"get_as_text")],
-        [Button.inline("📁 Get as File (.txt)", data=b"get_as_file")],
+        [Button.inline(f"📋 Get as Text ({len(working_list)})", data=f"txt_{actual_job_id}".encode())],
+        [Button.inline("📁 Get as File (.txt)", data=f"fil_{actual_job_id}".encode())],
         [Button.inline("🔄 Check New Links", data=b"back_to_start")]
     ]
 
@@ -1215,14 +1272,21 @@ async def start_check_callback(event):
 
 # --- RESULT DELIVERY HANDLERS ---
 
-@bot_client.on(events.CallbackQuery(data=b"get_as_text"))
+@bot_client.on(events.CallbackQuery(pattern=r'^(?:txt_([a-zA-Z0-9]+)|get_as_text)$'))
 async def get_text_callback(event):
     sender_id = event.sender_id
-    session = user_sessions.get(sender_id)
-    if not session or not session.get('results'):
-        return await event.answer("No completed results found. Please check again.", alert=True)
+    job_id = None
+    if event.pattern_match:
+        try:
+            job_id = event.pattern_match.group(1)
+        except Exception:
+            pass
 
-    working = session['results']['working']
+    job = active_jobs.get(job_id) if job_id else user_sessions.get(sender_id)
+    if not job or not job.get('results'):
+        return await event.answer("No completed results found for this batch. Please check again.", alert=True)
+
+    working = job['results']['working']
     if not working:
         return await event.answer("❌ No working links were found in this batch!", alert=True)
 
@@ -1232,11 +1296,12 @@ async def get_text_callback(event):
     for item in working:
         url = item['url']
         title = item.get('title')
-        members = item.get('members', 0)
+        members = item.get('members', 0) or 0
         if title:
-            lines.append(f"• [{title}]({url}) ({members} members)\n  `{url}`")
+            m_str = f" ({members} members)" if members > 0 else ""
+            lines.append(f"• {title}{m_str}\n  {url}")
         else:
-            lines.append(f"`{url}`")
+            lines.append(f"{url}")
 
     header = f"✅ **Working Links ({len(working)} Total):**\n\n"
     current_chunk = header
@@ -1256,15 +1321,22 @@ async def get_text_callback(event):
         await bot_client.send_message(sender_id, c, link_preview=False)
 
 
-@bot_client.on(events.CallbackQuery(data=b"get_as_file"))
+@bot_client.on(events.CallbackQuery(pattern=r'^(?:fil_([a-zA-Z0-9]+)|get_as_file)$'))
 async def get_file_callback(event):
     sender_id = event.sender_id
-    session = user_sessions.get(sender_id)
-    if not session or not session.get('results'):
-        return await event.answer("No completed results found. Please check again.", alert=True)
+    job_id = None
+    if event.pattern_match:
+        try:
+            job_id = event.pattern_match.group(1)
+        except Exception:
+            pass
 
-    working = session['results']['working']
-    total = session['results']['total']
+    job = active_jobs.get(job_id) if job_id else user_sessions.get(sender_id)
+    if not job or not job.get('results'):
+        return await event.answer("No completed results found for this batch. Please check again.", alert=True)
+
+    working = job['results']['working']
+    total = job['results']['total']
     if not working:
         return await event.answer("❌ No working links were found in this batch!", alert=True)
 
@@ -1278,7 +1350,7 @@ async def get_file_callback(event):
     for item in working:
         url = item['url']
         title = item.get('title') or 'N/A'
-        members = item.get('members', 0)
+        members = item.get('members', 0) or 0
         file_content += f"{url} | Title: {title} | Members: {members}\n"
 
     file_bytes = io.BytesIO(file_content.encode('utf-8'))
