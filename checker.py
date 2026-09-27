@@ -10,6 +10,7 @@ from telethon.errors import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
     FloodWaitError,
+    BotMethodInvalidError,
     RPCError,
 )
 from config import CHECK_DELAY
@@ -63,10 +64,9 @@ def parse_link(url: str) -> Tuple[str, str]:
     return ('unknown', url)
 
 
-async def check_single_link(client: TelegramClient, url: str) -> Dict[str, Any]:
+async def check_single_link(client: TelegramClient, url: str, retry_count: int = 0) -> Dict[str, Any]:
     """
-    Checks the validity of a single Telegram link using MTProto API.
-    Client must be an authorized MTProto client (User session or Bot).
+    Checks the validity of a single Telegram link using MTProto API with automatic FloodWait retry.
     """
     link_type, identifier = parse_link(url)
     
@@ -195,12 +195,26 @@ async def check_single_link(client: TelegramClient, url: str) -> Dict[str, Any]:
             'request_needed': False
         }
     except FloodWaitError as e:
-        print(f"⚠️ FloodWait encountered: sleeping {e.seconds}s...")
-        await asyncio.sleep(min(e.seconds, 5))
+        wait_seconds = min(e.seconds, 5)
+        if retry_count < 2:
+            print(f"⚠️ FloodWait ({e.seconds}s): Waiting {wait_seconds}s and retrying...")
+            await asyncio.sleep(wait_seconds)
+            return await check_single_link(client, url, retry_count=retry_count + 1)
         return {
             'url': url,
             'status': 'error',
-            'reason': f'Rate limited (FloodWait {e.seconds}s)',
+            'reason': f'FloodWait ({e.seconds}s)',
+            'title': None,
+            'members': 0,
+            'is_channel': False,
+            'is_group': False,
+            'request_needed': False
+        }
+    except BotMethodInvalidError:
+        return {
+            'url': url,
+            'status': 'error',
+            'reason': 'Engine disconnected (User login required)',
             'title': None,
             'members': 0,
             'is_channel': False,
@@ -209,11 +223,11 @@ async def check_single_link(client: TelegramClient, url: str) -> Dict[str, Any]:
         }
     except RPCError as e:
         error_msg = str(e)
-        if "INVITE_HASH_EXPIRED" in error_msg or "INVITE_HASH_INVALID" in error_msg:
+        if any(w in error_msg for w in ("INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "CHAT_INVALID", "PEER_ID_INVALID")):
             return {
                 'url': url,
                 'status': 'expired',
-                'reason': 'Invite link expired/invalid',
+                'reason': 'Invite link expired or invalid',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
@@ -223,7 +237,7 @@ async def check_single_link(client: TelegramClient, url: str) -> Dict[str, Any]:
         return {
             'url': url,
             'status': 'error',
-            'reason': f'API error: {error_msg}',
+            'reason': f'Telegram Error: {error_msg}',
             'title': None,
             'members': 0,
             'is_channel': False,
@@ -234,7 +248,7 @@ async def check_single_link(client: TelegramClient, url: str) -> Dict[str, Any]:
         return {
             'url': url,
             'status': 'error',
-            'reason': f'Error: {str(e)}',
+            'reason': f'{str(e)}',
             'title': None,
             'members': 0,
             'is_channel': False,
