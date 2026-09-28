@@ -238,24 +238,26 @@ def get_active_fsub_config() -> dict:
         except Exception:
             pass
     active_fsub_cache = {
-        "channel_id": FSUB_CHANNEL_ID,
+        "channel_id": 0,
         "access_hash": None,
         "title": "Official Channel",
-        "username": "Aysha_sama",
-        "invite_link": "https://t.me/Aysha_sama",
-        "full_id": FSUB_CHANNEL_ID
+        "username": None,
+        "invite_link": None,
+        "full_id": 0,
+        "enabled": False
     }
     return active_fsub_cache
 
-def set_active_fsub_config(channel_id: int, access_hash: int, title: str, username: str = None, invite_link: str = None, full_id: int = None):
+def set_active_fsub_config(channel_id: int, access_hash: int, title: str, username: str = None, invite_link: str = None, full_id: int = None, enabled: bool = True):
     global active_fsub_cache
     data = {
         "channel_id": channel_id,
         "access_hash": access_hash,
         "title": title or "Official Channel",
         "username": username,
-        "invite_link": invite_link or (f"https://t.me/{username}" if username else "https://t.me/Aysha_sama"),
-        "full_id": full_id or channel_id
+        "invite_link": invite_link or (f"https://t.me/{username}" if username else None),
+        "full_id": full_id or channel_id,
+        "enabled": enabled
     }
     active_fsub_cache = data
     try:
@@ -265,24 +267,43 @@ def set_active_fsub_config(channel_id: int, access_hash: int, title: str, userna
     except Exception as e:
         print(f"Error saving fsub config: {e}")
 
+def disable_fsub_config():
+    global active_fsub_cache
+    cfg = get_active_fsub_config()
+    cfg["enabled"] = False
+    active_fsub_cache = cfg
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(FSUB_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Error disabling fsub config: {e}")
+
 async def get_fsub_invite_link() -> str:
     """Returns a direct join link for the Force Sub channel."""
     cfg = get_active_fsub_config()
     if cfg.get("invite_link"):
         return cfg["invite_link"]
-    if cfg.get("username"):
+    if cfg.get("username") and cfg["username"].lower() != OWNER_USERNAME.lstrip('@').lower():
         return f"https://t.me/{cfg['username']}"
-    return "https://t.me/Aysha_sama"
+    return "https://t.me"
 
 
 async def check_fsub_membership(user_id: int, input_user=None) -> bool:
     """Checks if a user is a member of the Force Sub channel safely."""
     if is_admin(user_id):
         return True
-    
+
     cfg = get_active_fsub_config()
+    if not cfg.get("enabled", False):
+        return True
+
     ch_id = cfg.get("channel_id")
-    if not ch_id:
+    if not ch_id or ch_id == 0:
+        return True
+
+    # If configured username points to owner profile instead of a channel, do not block users!
+    if cfg.get("username") and cfg["username"].lower() == OWNER_USERNAME.lstrip('@').lower():
         return True
 
     access_hash = cfg.get("access_hash")
@@ -303,7 +324,7 @@ async def check_fsub_membership(user_id: int, input_user=None) -> bool:
             channel=channel_input,
             participant=input_user
         ))
-        
+
         p_obj = getattr(participant, 'participant', participant)
         if isinstance(p_obj, (types.ChannelParticipantBanned, types.ChannelParticipantLeft)):
             return False
@@ -313,16 +334,17 @@ async def check_fsub_membership(user_id: int, input_user=None) -> bool:
         err_msg = str(e).lower()
         if "usernotparticipant" in err_name or "user_not_participant" in err_msg:
             return False
+        # If channel is inaccessible or invalid, fail open so users aren't locked out
         print(f"FSub check caught for user {user_id}: {err_name} - {e}")
-        return False
+        return True
 
 
 async def send_fsub_prompt(event, user_id: int):
     """Prompts the user to join the Force Sub channel before using the bot."""
     channel_link = await get_fsub_invite_link()
     cfg = get_active_fsub_config()
-    channel_title = cfg.get("title", "Official Channel")
-    
+    channel_title = cfg.get("title") or "Official Channel"
+
     fsub_text = (
         "🔒 **Access Restricted: Join Channel First**\n\n"
         f"Bot use karne ke liye pehle hamare channel **{channel_title}** ko join karein.\n\n"
@@ -620,20 +642,77 @@ async def admin_fsub_panel_callback(event):
         pass
 
     cfg = get_active_fsub_config()
-    fsub_title = f"{cfg.get('title', 'Official Channel')} (`{cfg.get('full_id', cfg.get('channel_id'))}`)"
+    is_enabled = cfg.get("enabled", False) and cfg.get("channel_id", 0) != 0 and cfg.get("username") != OWNER_USERNAME.lstrip('@')
+    status_emoji = "🟢 Enabled" if is_enabled else "🔴 Disabled"
+    fsub_title = cfg.get('title', 'Not Configured') if is_enabled else "None"
+    fsub_link = cfg.get('invite_link', 'None') if is_enabled else "None"
 
     login_states[sender_id] = {'step': 'awaiting_fsub_forward'}
 
     text = (
-        "📢 **Force Subscribe Channel Setup**\n\n"
-        f"📌 **Active Channel:** {fsub_title}\n\n"
-        "👉 **Apne target channel se koi bhi message yahan FORWARD karein** (ya channel ka @username / ID bhejein).\n\n"
-        "⚠️ **Zaroori Shart:** Bot ka us channel me **Admin** hona laazmi hai! Agar bot admin nahi hoga toh error aayega."
+        "📢 **Force Subscribe (FSUB) Control Panel**\n\n"
+        f"⚡ **Status:** `{status_emoji}`\n"
+        f"📌 **Active Channel:** `{fsub_title}`\n"
+        f"🔗 **Join Link:** {fsub_link}\n\n"
+        "👉 **Naya Channel set karne ke liye:** Channel se koi bhi message yahan **FORWARD karein** (ya channel ka `@username` / ID bhejien).\n\n"
+        "⚠️ **Zaroori:** Bot ka target channel me **Admin** hona zaroori hai!"
     )
     buttons = [
-        [Button.inline("❌ Cancel", data=b"menu_admin_panel")]
+        [Button.inline("🔴 Turn OFF Force Sub", data=b"toggle_fsub_off")] if is_enabled else [Button.inline("📢 Set / Change Channel", data=b"start_fsub_set")],
+        [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
     ]
     await bot_client.send_message(sender_id, text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"start_fsub_set"))
+async def start_fsub_set_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Access Denied", alert=True)
+    login_states[sender_id] = {'step': 'awaiting_fsub_forward'}
+    await event.respond(
+        "📢 **Send Target Channel:**\n\n"
+        "Apne channel se koi bhi message yahan **FORWARD karein** ya channel username (`@channel_name`) reply karein."
+    )
+
+
+@bot_client.on(events.CallbackQuery(data=b"toggle_fsub_off"))
+async def toggle_fsub_off_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Access Denied", alert=True)
+    disable_fsub_config()
+    login_states.pop(sender_id, None)
+    await event.answer("✅ Force Subscribe has been TURNED OFF!", alert=True)
+    await admin_fsub_panel_callback(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^/fsub(?:\s+(.+))?$'))
+async def fsub_command_handler(event):
+    if not is_admin(event.sender_id):
+        return
+    arg = (event.pattern_match.group(1) or "").strip()
+    if arg.lower() in ("off", "disable", "stop", "0"):
+        disable_fsub_config()
+        return await event.respond("✅ **Force Subscribe has been DISABLED.** Users can now check links freely without joining any channel.")
+    elif arg:
+        event.text = arg
+        await process_fsub_forward_submission(event, event.sender_id)
+    else:
+        cfg = get_active_fsub_config()
+        is_enabled = cfg.get("enabled", False) and cfg.get("channel_id", 0) != 0
+        stat = "🟢 Enabled" if is_enabled else "🔴 Disabled"
+        title = cfg.get("title", "Not Configured")
+        link = cfg.get("invite_link", "None")
+        await event.respond(
+            f"📢 **Force Subscribe Status:** `{stat}`\n"
+            f"📌 **Channel:** `{title}`\n"
+            f"🔗 **Link:** {link}\n\n"
+            f"💡 **Commands:**\n"
+            f"• `/fsub off` - Turn OFF Force Subscribe\n"
+            f"• `/fsub @channel_name` - Set new Channel\n"
+            f"• Ya Admin Panel -> Force Subscribe me jakar message forward karein."
+        )
 
 
 @bot_client.on(events.CallbackQuery(data=b"back_to_start_new"))
@@ -935,6 +1014,18 @@ async def process_fsub_forward_submission(event, sender_id: int):
             "⚠️ **Channel detect nahi hua!**\n\n"
             "Channel se seedha **koi bhi message FORWARD karein** ya channel ka link/username (`@channel`) bhejien.\n\n"
             "*(Make sure forwarded message me channel ka naam show ho raha ho)*",
+            buttons=buttons
+        )
+
+    if isinstance(channel_entity, types.User):
+        login_states.pop(sender_id, None)
+        buttons = [
+            [Button.inline("🔄 Try Again", data=b"admin_fsub_panel")],
+            [Button.inline("⬅️ Back to Admin Panel", data=b"menu_admin_panel")]
+        ]
+        return await event.respond(
+            "❌ **Ye ek User Account / Profile hai, Channel nahi!**\n\n"
+            "Force Subscribe ke liye **apna Telegram Channel** forward karein ya channel username (`@channel_name`) bhejien.",
             buttons=buttons
         )
 
