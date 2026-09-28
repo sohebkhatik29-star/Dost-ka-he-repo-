@@ -1,17 +1,18 @@
 import time
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from telethon import TelegramClient
-from config import LOG_CHANNEL_ID
+from config import LOG_CHANNEL_ID, ADMIN_IDS
 
-async def log_bot_startup(bot_client: TelegramClient, admin_ids: list):
+async def log_bot_startup(bot_client: TelegramClient, admin_ids: Optional[list] = None):
     """Sends log when bot comes online."""
     try:
         await asyncio.sleep(2)
+        active_admins = admin_ids if admin_ids is not None else ADMIN_IDS
         log_msg = (
             "🤖 **#BOT_STARTED_ONLINE**\n\n"
             f"✅ **Status:** Running 24/7\n"
-            f"👑 **Admins:** `{len(admin_ids)} Active`\n"
+            f"👑 **Admins:** `{len(active_admins)} Active`\n"
             f"📢 **Log Channel:** Connected\n"
             f"📅 **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
         )
