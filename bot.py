@@ -668,11 +668,11 @@ async def start_check_callback(event):
         except asyncio.TimeoutError:
             res = {
                 'url': url,
-                'status': 'working',
-                'reason': 'Active invite link',
-                'title': 'Telegram Private Chat',
+                'status': 'expired',
+                'reason': 'Timeout / Inaccessible',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False
             }
