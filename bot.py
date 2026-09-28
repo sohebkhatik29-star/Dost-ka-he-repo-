@@ -3,6 +3,7 @@ import io
 import time
 import asyncio
 from typing import Dict, Any, List
+from aiohttp import web
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl import types, functions
@@ -43,8 +44,12 @@ from admin import (
     unban_user,
     get_stats,
     get_admin_dashboard_buttons,
+    start_login_request,
+    verify_login_code,
+    verify_login_2fa,
     known_users,
     banned_users,
+    login_states,
     SAVED_SESSION_FILE
 )
 
@@ -90,7 +95,6 @@ def create_checking_job(user_id: int, links: list) -> str:
         'is_running': False
     }
     user_latest_job[user_id] = job_id
-    # Prune old jobs older than 12 hours
     now = time.time()
     for jid in list(active_jobs.keys()):
         if now - active_jobs[jid].get('created_at', 0) > 43200:
@@ -284,7 +288,6 @@ async def fsub_command_handler(event):
             cfg["title"] = getattr(entity, 'title', 'Official Channel')
             cfg["is_active"] = True
 
-            # Try to get invite link
             if getattr(entity, 'username', None):
                 cfg["invite_link"] = f"https://t.me/{entity.username}"
             else:
@@ -381,6 +384,129 @@ async def admin_fsub_toggle_callback(event):
     save_fsub_config(cfg)
     await event.answer(f"Force Sub is now {'ENABLED' if cfg['is_active'] else 'DISABLED'}", alert=True)
     await admin_fsub_menu_callback(event)
+
+
+# --- MTPROTO ENGINE LOGIN INTERACTIVE CALLBACKS & COMMANDS ---
+
+@bot_client.on(events.CallbackQuery(data=b"admin_mtproto_status"))
+async def admin_mtproto_status_callback(event):
+    if not is_admin(event.sender_id):
+        return
+    user_auth = await ensure_user_client()
+    status_str = "🟢 **ONLINE & AUTHORIZED**" if user_auth else "🔴 **DISCONNECTED**"
+
+    text = (
+        "🔑 **MTPROTO ENGINE CONNECTION STATUS**\n\n"
+        f"• **Current Status:** {status_str}\n\n"
+        "Private Telegram invite links (`t.me/+...`) ko check karne ke liye MTProto engine connection zaroori hota hai.\n\n"
+        "👉 Agar engine disconnect hai, toh neeche button dabakar apna number enter karein:"
+    )
+    buttons = [
+        [Button.inline("🔑 Connect / Re-login Now", data=b"start_login_flow")],
+        [Button.inline("🔙 Back to Admin", data=b"admin_main")]
+    ]
+    await event.edit(text, buttons=buttons)
+
+
+@bot_client.on(events.CallbackQuery(data=b"start_login_flow"))
+async def start_login_flow_callback(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return await event.answer("Admin only.", alert=True)
+
+    text = (
+        "📱 **STEP 1: Enter Your Phone Number**\n\n"
+        "Apna Telegram account phone number international format me send karein:\n\n"
+        "👉 Send command: `/phone +919876543210`\n\n"
+        "*(Note: Telegram se aapke number par OTP aayega)*"
+    )
+    await event.edit(text, buttons=[[Button.inline("🔙 Cancel", data=b"admin_main")]])
+
+
+@bot_client.on(events.NewMessage(pattern=r'^/phone(?:\s+(.+))?$'))
+async def phone_command_handler(event):
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return
+
+    phone = (event.pattern_match.group(1) or "").strip()
+    if not phone:
+        return await event.respond("👉 Format: `/phone +919876543210`")
+
+    status_msg = await event.respond("⏳ Sending Telegram verification code...")
+    success, msg = await start_login_request(sender_id, phone)
+
+    if success:
+        await status_msg.edit(
+            f"📩 **STEP 2: Enter Telegram OTP Code**\n\n"
+            f"Telegram app me aaye hue 5-digit code ko send karein:\n\n"
+            f"👉 Format: `/code 12345`\n\n"
+            f"*(Phone: `{phone}`)*"
+        )
+    else:
+        await status_msg.edit(msg)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^/code(?:\s+(.+))?$'))
+async def code_command_handler(event):
+    global user_client
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return
+
+    code = (event.pattern_match.group(1) or "").strip()
+    if not code:
+        return await event.respond("👉 Format: `/code 12345`")
+
+    status_msg = await event.respond("⏳ Verifying OTP code...")
+    success, msg, new_client, session_str = await verify_login_code(sender_id, code)
+
+    if success:
+        user_client = new_client
+        await status_msg.edit(
+            "🎉 **MTPROTO ENGINE CONNECTED SUCCESSFULLY!**\n\n"
+            "✅ Aapka user engine successfully login ho gaya hai.\n"
+            "✅ Ab private channels aur invite links 100% precision ke sath check honge.\n\n"
+            "📋 **Permanent Session String (For Render 24/7):**\n"
+            f"`{session_str}`\n\n"
+            "*(Isko copy karke Render ke Environment Variables me `SESSION_STRING` name se add kar sakte hain taaki server restart hone par bhi session na chute)*"
+        )
+    elif msg == "2FA_REQUIRED":
+        await status_msg.edit(
+            "🔐 **STEP 3: Two-Step Verification (2FA) Password**\n\n"
+            "Aapke account par Two-Step Verification enabled hai.\n\n"
+            "👉 Send command: `/password YourTelegramPassword`"
+        )
+    else:
+        await status_msg.edit(msg)
+
+
+@bot_client.on(events.NewMessage(pattern=r'^/password(?:\s+(.+))?$'))
+async def password_command_handler(event):
+    global user_client
+    sender_id = event.sender_id
+    if not is_admin(sender_id):
+        return
+
+    password = (event.pattern_match.group(1) or "").strip()
+    if not password:
+        return await event.respond("👉 Format: `/password YourPassword`")
+
+    status_msg = await event.respond("⏳ Verifying 2FA password...")
+    success, msg, new_client, session_str = await verify_login_2fa(sender_id, password)
+
+    if success:
+        user_client = new_client
+        await status_msg.edit(
+            "🎉 **MTPROTO ENGINE CONNECTED SUCCESSFULLY!**\n\n"
+            "✅ Aapka user engine successfully login ho gaya hai.\n"
+            "✅ Ab private channels aur invite links 100% precision ke sath check honge.\n\n"
+            "📋 **Permanent Session String (For Render 24/7):**\n"
+            f"`{session_str}`\n\n"
+            "*(Isko copy karke Render ke Environment Variables me `SESSION_STRING` name se add kar sakte hain)*"
+        )
+    else:
+        await status_msg.edit(msg)
 
 
 # --- MESSAGE ROUTING & BATCH LINK CHECKING ---
@@ -497,12 +623,33 @@ async def start_check_callback(event):
     if job.get('is_running'):
         return await event.answer("⏳ Verification is already running for this batch!", alert=True)
 
-    job['is_running'] = True
     links = job['pending_links']
     total_count = len(links)
 
-    # Check MTProto connection
+    # Check MTProto User Engine connection
     is_user_auth = await ensure_user_client()
+    has_private_links = any(parse_link(u)[0] == 'invite' for u in links)
+
+    if has_private_links and not is_user_auth:
+        job['is_running'] = False
+        if is_admin(sender_id):
+            buttons = [
+                [Button.inline("🔑 Connect Engine Now (1-Click)", data=b"start_login_flow")],
+                [Button.inline("❌ Cancel", data=f"chk_cancel:{job_id}".encode())]
+            ]
+            return await event.edit(
+                "⚠️ **Admin Notice: MTProto User Engine Disconnected**\n\n"
+                "Private invite links (`t.me/+...`) ko accurately verify karne ke liye MTProto engine connection zaroori hai.\n\n"
+                "👉 **Neeche button dabayein aur 15 second me connect karein:**",
+                buttons=buttons
+            )
+        else:
+            return await event.edit(
+                "⚠️ **Bot Engine Maintenance**\n\n"
+                "Bot is currently establishing MTProto connection. Please try again in 1 minute!"
+            )
+
+    job['is_running'] = True
     active_client = user_client if is_user_auth else bot_client
 
     await event.edit(
@@ -600,29 +747,27 @@ async def get_text_callback(event):
         url = item['url']
         title = item.get('title')
         members = item.get('members', 0)
-        req = item.get('request_needed', False)
-        suffix = " (Join Request)" if req else ""
+        req_needed = item.get('request_needed', False)
         if title:
-            lines.append(f"• [{title}]({url}) ({members} members){suffix}\n  `{url}`")
+            badge = " (Request Needed)" if req_needed else ""
+            lines.append(f"• **{title}** ({members} members){badge}\n  {url}")
         else:
-            lines.append(f"`{url}`")
+            lines.append(f"• {url}")
 
     header = f"✅ **Working Links ({len(working)} Total):**\n\n"
-    current_chunk = header
     chunks = []
-
+    current_chunk = header
     for line in lines:
         if len(current_chunk) + len(line) + 2 > 3500:
             chunks.append(current_chunk)
             current_chunk = line + "\n\n"
         else:
             current_chunk += line + "\n\n"
-
-    if current_chunk.strip():
+    if current_chunk:
         chunks.append(current_chunk)
 
-    for c in chunks:
-        await bot_client.send_message(sender_id, c, link_preview=False)
+    for chunk in chunks:
+        await bot_client.send_message(sender_id, chunk, link_preview=False)
 
 
 @bot_client.on(events.CallbackQuery(pattern=r'^(?:chk_file:(.+)|get_as_file)$'))
@@ -638,72 +783,70 @@ async def get_file_callback(event):
         return await event.answer("No completed results found for this batch. Please check again.", alert=True)
 
     working = job['results']['working']
-    total = job['results']['total']
     if not working:
         return await event.answer("❌ No working links were found in this batch!", alert=True)
 
-    await event.answer("Generating .txt file...")
+    await event.answer("Generating report file...")
 
-    file_content = f"# TELEGRAM WORKING INVITE LINKS REPORT\n"
-    file_content += f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n"
-    file_content += f"# Total Checked: {total} | Active/Working: {len(working)}\n"
-    file_content += "# " + "="*50 + "\n\n"
-
+    content = f"# Verified Working Telegram Links ({len(working)} Total)\n"
+    content += f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n\n"
     for item in working:
         url = item['url']
-        title = item.get('title') or 'N/A'
+        title = item.get('title')
         members = item.get('members', 0)
-        req = " [Join Request]" if item.get('request_needed') else ""
-        file_content += f"{url} | Title: {title} | Members: {members}{req}\n"
+        if title:
+            content += f"{title} | {members} members\n{url}\n\n"
+        else:
+            content += f"{url}\n"
 
-    file_bytes = io.BytesIO(file_content.encode('utf-8'))
+    file_bytes = io.BytesIO(content.encode('utf-8'))
     file_bytes.name = f"working_links_{int(time.time())}.txt"
 
     caption = (
-        f"📄 **Working Links Export**\n\n"
-        f"✅ Total Working: `{len(working)} / {total}`\n"
-        f"All verified invite links are listed inside."
+        "📁 **Verified Working Links File**\n\n"
+        f"• **Total Working Links:** `{len(working)}`\n"
+        f"• **Generated:** `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
     )
+    await bot_client.send_file(sender_id, file_bytes, caption=caption)
 
-    await bot_client.send_file(sender_id, file=file_bytes, caption=caption)
 
-
-# --- HEALTH SERVER FOR RENDER 24/7 ---
+# --- 24/7 RENDER HTTP HEALTH CHECK SERVER ---
 
 async def health_check_handler(request):
-    from aiohttp import web
-    return web.Response(text="TG Link Checker Bot is running 24/7!")
-
+    return web.Response(text="Bulk Telegram Link Checker Bot is Running 24/7 Online!", status=200)
 
 async def start_web_server():
-    from aiohttp import web
-    port = int(os.environ.get("PORT", 8080))
     app = web.Application()
-    app.router.add_get("/", health_check_handler)
-    app.router.add_get("/health", health_check_handler)
+    app.router.add_get('/', health_check_handler)
+    app.router.add_get('/health', health_check_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 Health server listening on port {port}")
+    print(f"🌐 Health server running on port {port}")
 
+
+# --- MAIN RUNNER ---
 
 async def main():
-    try:
-        await start_web_server()
-    except Exception as e:
-        print(f"Web server notice: {e}")
+    print("🚀 Starting Bulk Telegram Link Checker Bot...")
 
-    print("=" * 60)
-    print("🚀 Modular Telegram Link Checker Bot is STARTING...")
-    print(f"👑 Admin IDs: {ADMIN_IDS}")
-    print(f"📢 Log Channel: Active")
-    print(f"🔒 Force Sub Channel: Active")
-    print("=" * 60)
+    # Warm user client connection
+    asyncio.create_task(ensure_user_client())
 
-    asyncio.create_task(log_bot_startup(bot_client, ADMIN_IDS))
+    # Start Web Server
+    await start_web_server()
+
+    # Log Bot Startup
+    asyncio.create_task(log_bot_startup(bot_client))
+
+    print("✅ Bot is online and listening for events!")
     await bot_client.run_until_disconnected()
 
 
 if __name__ == '__main__':
-    bot_client.loop.run_until_complete(main())
+    try:
+        bot_client.loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by admin.")
