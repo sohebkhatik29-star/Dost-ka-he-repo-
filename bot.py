@@ -687,7 +687,7 @@ async def start_check_callback(event):
             except Exception:
                 pass
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.35)
 
     job['is_running'] = False
     job['results'] = {
