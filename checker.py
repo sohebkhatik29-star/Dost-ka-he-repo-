@@ -406,7 +406,7 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except FloodWaitError as e:
-            wait_time = min(e.seconds, 15)
+            wait_time = e.seconds
             if attempt < max_retries and e.seconds <= 60:
                 print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Waiting {wait_time}s and retrying...")
                 await asyncio.sleep(wait_time + 0.5)
