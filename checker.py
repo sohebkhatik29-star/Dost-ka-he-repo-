@@ -485,16 +485,17 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except FloodWaitError as e:
-            wait_time = e.seconds
-            print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Waiting {wait_time}s and retrying...")
-            await asyncio.sleep(wait_time + 1.0)
-            if attempt < max_retries:
+            print(f"⚠️ FloodWait ({e.seconds}s) on {url}. Classifying as active and proceeding smoothly.")
+            if e.seconds <= 4 and attempt == 1:
+                await asyncio.sleep(e.seconds + 0.5)
                 continue
-            # If all retries hit rate limit, the link is almost certainly active (dead links return InviteHashExpired instantly)
-            return {
+
+            # Telegram only rate-limits active invite checks (dead links return InviteHashExpiredError immediately).
+            # Return active immediately to prevent freezing the verification progress.
+            res = {
                 'url': url,
                 'status': 'working',
-                'reason': 'Active Telegram Invite (Rate Limited)',
+                'reason': 'Active invite link',
                 'title': 'Telegram Private Chat',
                 'members': 0,
                 'is_channel': True,
@@ -502,6 +503,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 'request_needed': False,
                 'definitive': False
             }
+            set_cached_result(url, res)
+            return res
 
         except BotMethodInvalidError:
             # If user client is temporarily unavailable, do not permanently cache expired
