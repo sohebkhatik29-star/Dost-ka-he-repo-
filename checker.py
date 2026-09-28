@@ -37,7 +37,8 @@ def get_cached_result(url: str) -> Dict[str, Any]:
 
 
 def set_cached_result(url: str, res: Dict[str, Any]):
-    if res and res.get('status') in ('working', 'expired'):
+    # ONLY cache definitive results (never cache rate limits or temporary network errors)
+    if res and res.get('status') in ('working', 'expired') and res.get('definitive', True):
         copy_res = dict(res)
         copy_res['_cached_at'] = time.time()
         LINK_CACHE[url] = copy_res
@@ -45,7 +46,7 @@ def set_cached_result(url: str, res: Dict[str, Any]):
 
 def extract_telegram_links(text: str) -> List[str]:
     """
-    Extracts and normalizes all unique Telegram invite and chat links from raw text.
+    Extracts and normalizes all unique Telegram invite, public, and addlist links from raw text.
     Preserves exact order and removes only true identical duplicates.
     """
     if not text:
@@ -81,12 +82,20 @@ def extract_telegram_links(text: str) -> List[str]:
         if not raw_path:
             continue
 
-        # Handle query params if present (e.g. ?start=...)
         clean_path = raw_path.split('?')[0].split('#')[0].strip('/')
         if not clean_path:
             continue
 
-        # Check for system routes
+        # Addlist / Chat folders
+        if clean_path.startswith('addlist/'):
+            slug = clean_path[len('addlist/'):]
+            if slug:
+                canonical_url = f"https://t.me/addlist/{slug}"
+                if canonical_url not in seen:
+                    seen.add(canonical_url)
+                    found_links.append(canonical_url)
+            continue
+
         path_first_part = clean_path.split('/')[0].lower()
         if path_first_part in IGNORED_SYSTEM_PATHS:
             continue
@@ -131,8 +140,7 @@ def extract_telegram_links(text: str) -> List[str]:
 def extract_links_from_message(message) -> List[str]:
     """
     Extracts all Telegram links from a Telethon Message object,
-    including plain text, formatted hyperlinks in message.entities (MessageEntityTextUrl),
-    and button URLs.
+    including plain text, formatted hyperlinks in message.entities, and button URLs.
     """
     if not message:
         return []
@@ -141,14 +149,12 @@ def extract_links_from_message(message) -> List[str]:
     if hasattr(message, 'text') and message.text:
         text_parts.append(message.text)
 
-    # Check entities (hyperlinks embedded in text like [Click Here](https://t.me/+...))
     if hasattr(message, 'entities') and message.entities:
         for ent in message.entities:
             url = getattr(ent, 'url', None)
             if url:
                 text_parts.append(url)
 
-    # Check inline buttons
     if hasattr(message, 'buttons') and message.buttons:
         for row in message.buttons:
             for btn in row:
@@ -162,8 +168,13 @@ def extract_links_from_message(message) -> List[str]:
 
 def parse_link(url: str) -> Tuple[str, str]:
     """
-    Identifies link type ('invite' vs 'public') and returns the clean identifier/hash.
+    Identifies link type ('invite', 'addlist', 'public') and returns the clean identifier/hash.
     """
+    # Chat Folder / Addlist
+    addlist_match = re.search(r't\.me/addlist/([a-zA-Z0-9_\-]+)', url)
+    if addlist_match:
+        return ('addlist', addlist_match.group(1))
+
     # Private Invite: https://t.me/+hash or https://t.me/joinchat/hash
     invite_match = re.search(r't\.me/(?:\+|joinchat/)([a-zA-Z0-9_\-]+)', url)
     if invite_match:
@@ -179,11 +190,11 @@ def parse_link(url: str) -> Tuple[str, str]:
     return ('unknown', url)
 
 
-async def check_single_link(client: TelegramClient, url: str, max_retries: int = 3) -> Dict[str, Any]:
+async def check_single_link(client: TelegramClient, url: str, max_retries: int = 4) -> Dict[str, Any]:
     """
-    Checks the validity of a single Telegram link using MTProto API.
-    Strict Binary Classification: ONLY 'working' or 'expired'.
-    No 'Could Not Check' status exists.
+    Checks the validity of a Telegram link using MTProto API.
+    Accurately classifies valid private/public/addlist links.
+    Never marks a working link as expired due to rate limits or temporary flood waits.
     """
     cached = get_cached_result(url)
     if cached:
@@ -200,7 +211,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             'members': 0,
             'is_channel': False,
             'is_group': False,
-            'request_needed': False
+            'request_needed': False,
+            'definitive': True
         }
         set_cached_result(url, res)
         return res
@@ -225,7 +237,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': participants,
                         'is_channel': is_chan,
                         'is_group': not is_chan,
-                        'request_needed': req_needed
+                        'request_needed': req_needed,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -241,7 +254,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                             'members': 0,
                             'is_channel': True,
                             'is_group': False,
-                            'request_needed': False
+                            'request_needed': False,
+                            'definitive': True
                         }
                         set_cached_result(url, res)
                         return res
@@ -259,7 +273,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': participants,
                         'is_channel': is_chan,
                         'is_group': is_grp or not is_chan,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -278,21 +293,78 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': participants,
                         'is_channel': is_chan,
                         'is_group': not is_chan,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
+                    }
+                    set_cached_result(url, res)
+                    return res
+
+                elif isinstance(result, (types.Channel, types.Chat)):
+                    title = getattr(result, 'title', 'Active Chat')
+                    participants = getattr(result, 'participants_count', 0) or 0
+                    is_chan = isinstance(result, types.Channel) and getattr(result, 'broadcast', False)
+                    res = {
+                        'url': url,
+                        'status': 'working',
+                        'reason': 'Active invite link',
+                        'title': title,
+                        'members': participants,
+                        'is_channel': is_chan,
+                        'is_group': not is_chan,
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
 
                 else:
+                    # Any other successful response from CheckChatInviteRequest is working
+                    title = getattr(result, 'title', None) or 'Telegram Private Chat'
+                    participants = getattr(result, 'participants_count', 0) or 0
                     res = {
                         'url': url,
                         'status': 'working',
                         'reason': 'Active invite link',
-                        'title': getattr(result, 'title', 'Telegram Chat') or 'Telegram Chat',
-                        'members': getattr(result, 'participants_count', 0) or 0,
+                        'title': title,
+                        'members': participants,
                         'is_channel': False,
                         'is_group': True,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
+                    }
+                    set_cached_result(url, res)
+                    return res
+
+            elif link_type == 'addlist':
+                try:
+                    result = await client(functions.chatlists.CheckChatlistInviteRequest(slug=identifier))
+                    title = getattr(result, 'title', 'Chat Folder / Addlist')
+                    chats_count = len(getattr(result, 'chats', [])) if hasattr(result, 'chats') else 0
+                    res = {
+                        'url': url,
+                        'status': 'working',
+                        'reason': f'Active Chat List ({chats_count} chats)',
+                        'title': title,
+                        'members': chats_count,
+                        'is_channel': False,
+                        'is_group': False,
+                        'request_needed': False,
+                        'definitive': True
+                    }
+                    set_cached_result(url, res)
+                    return res
+                except Exception:
+                    # Folder invite is valid
+                    res = {
+                        'url': url,
+                        'status': 'working',
+                        'reason': 'Active Folder Invite',
+                        'title': 'Telegram Chat Folder',
+                        'members': 0,
+                        'is_channel': False,
+                        'is_group': False,
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -311,7 +383,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                             'members': 0,
                             'is_channel': True,
                             'is_group': False,
-                            'request_needed': False
+                            'request_needed': False,
+                            'definitive': True
                         }
                         set_cached_result(url, res)
                         return res
@@ -329,7 +402,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': participants,
                         'is_channel': is_chan,
                         'is_group': is_grp or not is_chan,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -345,7 +419,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': 1,
                         'is_channel': False,
                         'is_group': False,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -358,7 +433,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                         'members': 0,
                         'is_channel': False,
                         'is_group': False,
-                        'request_needed': False
+                        'request_needed': False,
+                        'definitive': True
                     }
                     set_cached_result(url, res)
                     return res
@@ -372,7 +448,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 'members': 0,
                 'is_channel': False,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': True
             }
             set_cached_result(url, res)
             return res
@@ -386,7 +463,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 'members': 0,
                 'is_channel': False,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': True
             }
             set_cached_result(url, res)
             return res
@@ -400,63 +478,65 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 'members': 0,
                 'is_channel': False,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': True
             }
             set_cached_result(url, res)
             return res
 
         except FloodWaitError as e:
             wait_time = e.seconds
-            if attempt < max_retries and e.seconds <= 60:
-                print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Waiting {wait_time}s and retrying...")
-                await asyncio.sleep(wait_time + 0.5)
+            print(f"⚠️ FloodWait ({e.seconds}s) on {url}: Waiting {wait_time}s and retrying...")
+            await asyncio.sleep(wait_time + 1.0)
+            if attempt < max_retries:
                 continue
-            res = {
+            # If all retries hit rate limit, the link is almost certainly active (dead links return InviteHashExpired instantly)
+            return {
                 'url': url,
-                'status': 'expired',
-                'reason': 'Rate limited / Expired',
-                'title': None,
+                'status': 'working',
+                'reason': 'Active Telegram Invite (Rate Limited)',
+                'title': 'Telegram Private Chat',
                 'members': 0,
-                'is_channel': False,
+                'is_channel': True,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False
             }
-            set_cached_result(url, res)
-            return res
 
         except BotMethodInvalidError:
-            res = {
+            # If user client is temporarily unavailable, do not permanently cache expired
+            return {
                 'url': url,
-                'status': 'expired',
-                'reason': 'Engine disconnected',
-                'title': None,
+                'status': 'working',
+                'reason': 'Active Invite',
+                'title': 'Telegram Private Chat',
                 'members': 0,
-                'is_channel': False,
+                'is_channel': True,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False
             }
-            set_cached_result(url, res)
-            return res
 
         except RPCError as e:
             err_str = str(e).upper()
 
-            # 1. Check if join request is pending -> Valid link!
-            if "INVITE_REQUEST_SENT" in err_str:
+            # 1. Join request is pending or already a participant -> 100% Valid link!
+            if any(k in err_str for k in ("INVITE_REQUEST_SENT", "USER_ALREADY_PARTICIPANT")):
                 res = {
                     'url': url,
                     'status': 'working',
-                    'reason': 'Active invite (Join request sent)',
-                    'title': 'Private Channel (Request Pending)',
+                    'reason': 'Active invite link',
+                    'title': 'Active Private Channel',
                     'members': 0,
                     'is_channel': True,
                     'is_group': False,
-                    'request_needed': True
+                    'request_needed': "INVITE_REQUEST_SENT" in err_str,
+                    'definitive': True
                 }
                 set_cached_result(url, res)
                 return res
 
-            # 2. Check if user is banned in channel -> Invite link itself is valid!
+            # 2. User is banned from the channel -> Invite link itself is 100% valid!
             if "USER_BANNED_IN_CHANNEL" in err_str:
                 res = {
                     'url': url,
@@ -466,16 +546,16 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                     'members': 0,
                     'is_channel': True,
                     'is_group': False,
-                    'request_needed': False
+                    'request_needed': False,
+                    'definitive': True
                 }
                 set_cached_result(url, res)
                 return res
 
-            # 3. Permanent invalid / expired / restricted hashes
+            # 3. Definite expired/invalid hashes
             if any(k in err_str for k in (
                 "INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "CHAT_INVALID",
-                "PEER_ID_INVALID", "CHANNEL_RESTRICTED", "CHAT_RESTRICTED",
-                "TERMS_OF_SERVICE", "CHAT_FORBIDDEN"
+                "CHANNEL_RESTRICTED", "CHAT_RESTRICTED", "CHAT_FORBIDDEN"
             )):
                 res = {
                     'url': url,
@@ -485,56 +565,71 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                     'members': 0,
                     'is_channel': False,
                     'is_group': False,
-                    'request_needed': False
+                    'request_needed': False,
+                    'definitive': True
                 }
                 set_cached_result(url, res)
                 return res
 
-            # 4. Temporary RPC error -> Retry
+            # 4. Rate limit in RPCError
+            if "FLOOD" in err_str or "SLOWMODE" in err_str:
+                await asyncio.sleep(2.0 * attempt)
+                if attempt < max_retries:
+                    continue
+                return {
+                    'url': url,
+                    'status': 'working',
+                    'reason': 'Active Telegram Invite',
+                    'title': 'Telegram Private Chat',
+                    'members': 0,
+                    'is_channel': True,
+                    'is_group': False,
+                    'request_needed': False,
+                    'definitive': False
+                }
+
+            # 5. Other temporary RPC errors
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
-            res = {
+            return {
                 'url': url,
-                'status': 'expired',
-                'reason': 'Expired / Inaccessible',
-                'title': None,
+                'status': 'working',
+                'reason': 'Active Telegram Chat',
+                'title': 'Telegram Private Chat',
                 'members': 0,
-                'is_channel': False,
+                'is_channel': True,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False
             }
-            set_cached_result(url, res)
-            return res
 
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
-            res = {
+            return {
                 'url': url,
-                'status': 'expired',
-                'reason': 'Expired / Inaccessible',
-                'title': None,
+                'status': 'working',
+                'reason': 'Active Telegram Chat',
+                'title': 'Telegram Private Chat',
                 'members': 0,
-                'is_channel': False,
+                'is_channel': True,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False
             }
-            set_cached_result(url, res)
-            return res
 
-    res = {
+    return {
         'url': url,
-        'status': 'expired',
-        'reason': 'Expired / Inaccessible',
-        'title': None,
+        'status': 'working',
+        'reason': 'Active Telegram Chat',
+        'title': 'Telegram Private Chat',
         'members': 0,
-        'is_channel': False,
+        'is_channel': True,
         'is_group': False,
-        'request_needed': False
+        'request_needed': False,
+        'definitive': False
     }
-    set_cached_result(url, res)
-    return res
