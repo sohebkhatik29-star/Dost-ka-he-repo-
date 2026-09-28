@@ -15,15 +15,15 @@ from telethon.errors import (
     RPCError,
 )
 
-# Persistent link verification cache (to avoid duplicate MTProto requests)
+# Persistent link verification cache (only for definitively verified links)
 LINK_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 3600  # 1 hour cache TTL
+CACHE_TTL = 300  # 5 minutes TTL for verified links
 
 # Non-chat Telegram system paths to ignore
 IGNORED_SYSTEM_PATHS = {
     'c', 's', 'share', 'iv', 'proxy', 'socks', 'addstickers',
     'addemoji', 'addtheme', 'invoice', 'boost', 'setlanguage',
-    'login', 'passport', 'terms', 'privacy'
+    'login', 'passport', 'terms', 'privacy', 'addlist', 'joinchat'
 }
 
 
@@ -37,8 +37,7 @@ def get_cached_result(url: str) -> Dict[str, Any]:
 
 
 def set_cached_result(url: str, res: Dict[str, Any]):
-    # ONLY cache definitive results (never cache rate limits or temporary network errors)
-    if res and res.get('status') in ('working', 'expired') and res.get('definitive', True):
+    if res and res.get('definitive') is True and res.get('status') in ('working', 'expired'):
         copy_res = dict(res)
         copy_res['_cached_at'] = time.time()
         LINK_CACHE[url] = copy_res
@@ -46,8 +45,8 @@ def set_cached_result(url: str, res: Dict[str, Any]):
 
 def extract_telegram_links(text: str) -> List[str]:
     """
-    Extracts and normalizes all unique Telegram invite, public, and addlist links from raw text.
-    Preserves exact order and removes only true identical duplicates.
+    Extracts and normalizes all unique Telegram invite, public, and folder links from raw text.
+    Preserves exact order and removes identical duplicates.
     """
     if not text:
         return []
@@ -71,7 +70,15 @@ def extract_telegram_links(text: str) -> List[str]:
                 seen.add(canonical)
                 found_links.append(canonical)
 
-    # 2. Regex search for standard URLs
+    # 2. Addlist / Folder links (https://t.me/addlist/slug)
+    addlist_matches = re.findall(r'(?:https?://)?(?:www\.)?t(?:elegram)?\.(?:me|dog)/addlist/([a-zA-Z0-9_\-]+)', text, re.IGNORECASE)
+    for slug in addlist_matches:
+        canonical = f"https://t.me/addlist/{slug}"
+        if canonical not in seen:
+            seen.add(canonical)
+            found_links.append(canonical)
+
+    # 3. Regex search for standard URLs
     url_pattern = re.compile(
         r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/([^\s\n\(\)\[\]\{\}<>"\',;]+)',
         re.IGNORECASE
@@ -86,17 +93,20 @@ def extract_telegram_links(text: str) -> List[str]:
         if not clean_path:
             continue
 
-        # Addlist / Chat folders
-        if clean_path.startswith('addlist/'):
-            slug = clean_path[len('addlist/'):]
-            if slug:
+        path_first_part = clean_path.split('/')[0].lower()
+
+        # Handle Addlist folder
+        if path_first_part == 'addlist':
+            parts = clean_path.split('/')
+            if len(parts) >= 2 and parts[1]:
+                slug = parts[1]
                 canonical_url = f"https://t.me/addlist/{slug}"
                 if canonical_url not in seen:
                     seen.add(canonical_url)
                     found_links.append(canonical_url)
             continue
 
-        path_first_part = clean_path.split('/')[0].lower()
+        # Ignore non-chat system routes
         if path_first_part in IGNORED_SYSTEM_PATHS:
             continue
 
@@ -118,13 +128,13 @@ def extract_telegram_links(text: str) -> List[str]:
         else:
             # Public username
             username = clean_path.split('/')[0]
-            if re.match(r'^[a-zA-Z0-9_]{4,32}$', username) and not username.isdigit():
+            if re.match(r'^[a-zA-Z0-9_]{4,32}$', username) and not username.isdigit() and username.lower() not in IGNORED_SYSTEM_PATHS:
                 canonical_url = f"https://t.me/{username}"
                 if canonical_url not in seen:
                     seen.add(canonical_url)
                     found_links.append(canonical_url)
 
-    # 3. Extract standalone @usernames
+    # 4. Extract standalone @usernames
     at_matches = re.findall(r'(?:^|[\s\n\(\[\{<])@([a-zA-Z0-9_]{4,32})', text)
     for uname in at_matches:
         if uname.lower() in IGNORED_SYSTEM_PATHS or uname.isdigit():
@@ -140,7 +150,8 @@ def extract_telegram_links(text: str) -> List[str]:
 def extract_links_from_message(message) -> List[str]:
     """
     Extracts all Telegram links from a Telethon Message object,
-    including plain text, formatted hyperlinks in message.entities, and button URLs.
+    including plain text, formatted hyperlinks in message.entities (MessageEntityTextUrl),
+    and button URLs.
     """
     if not message:
         return []
@@ -175,6 +186,10 @@ def parse_link(url: str) -> Tuple[str, str]:
     if addlist_match:
         return ('addlist', addlist_match.group(1))
 
+    # Bare addlist without slug -> Invalid / Expired
+    if re.search(r't\.me/addlist/?$', url):
+        return ('unknown', url)
+
     # Private Invite: https://t.me/+hash or https://t.me/joinchat/hash
     invite_match = re.search(r't\.me/(?:\+|joinchat/)([a-zA-Z0-9_\-]+)', url)
     if invite_match:
@@ -190,11 +205,12 @@ def parse_link(url: str) -> Tuple[str, str]:
     return ('unknown', url)
 
 
-async def check_single_link(client: TelegramClient, url: str, max_retries: int = 4) -> Dict[str, Any]:
+async def check_single_link(client: TelegramClient, url: str, max_retries: int = 3) -> Dict[str, Any]:
     """
     Checks the validity of a Telegram link using MTProto API.
-    Accurately classifies valid private/public/addlist links.
-    Never marks a working link as expired due to rate limits or temporary flood waits.
+    Strict Binary Truth:
+    - Working ONLY if link is genuinely verified active.
+    - Expired if link is dead, revoked, restricted, deleted, or invalid.
     """
     cached = get_cached_result(url)
     if cached:
@@ -318,7 +334,6 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                     return res
 
                 else:
-                    # Any other successful response from CheckChatInviteRequest is working
                     title = getattr(result, 'title', None) or 'Telegram Private Chat'
                     participants = getattr(result, 'participants_count', 0) or 0
                     res = {
@@ -353,21 +368,36 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                     }
                     set_cached_result(url, res)
                     return res
-                except Exception:
-                    # Folder invite is valid
-                    res = {
-                        'url': url,
-                        'status': 'working',
-                        'reason': 'Active Folder Invite',
-                        'title': 'Telegram Chat Folder',
-                        'members': 0,
-                        'is_channel': False,
-                        'is_group': False,
-                        'request_needed': False,
-                        'definitive': True
-                    }
-                    set_cached_result(url, res)
-                    return res
+                except (InviteHashExpiredError, InviteHashInvalidError, RPCError) as add_err:
+                    add_err_str = str(add_err).upper()
+                    if any(k in add_err_str for k in ("INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "SLUG_INVALID", "CHATLIST_EXPIRED")):
+                        res = {
+                            'url': url,
+                            'status': 'expired',
+                            'reason': 'Folder invite expired or invalid',
+                            'title': None,
+                            'members': 0,
+                            'is_channel': False,
+                            'is_group': False,
+                            'request_needed': False,
+                            'definitive': True
+                        }
+                        set_cached_result(url, res)
+                        return res
+                    else:
+                        res = {
+                            'url': url,
+                            'status': 'working',
+                            'reason': 'Active Chat Folder',
+                            'title': 'Telegram Chat Folder',
+                            'members': 0,
+                            'is_channel': False,
+                            'is_group': False,
+                            'request_needed': False,
+                            'definitive': True
+                        }
+                        set_cached_result(url, res)
+                        return res
 
             elif link_type == 'public':
                 resolved = await client(functions.contacts.ResolveUsernameRequest(username=identifier))
@@ -427,9 +457,9 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 else:
                     res = {
                         'url': url,
-                        'status': 'working',
-                        'reason': 'Active public link',
-                        'title': identifier,
+                        'status': 'expired',
+                        'reason': 'Username not found',
+                        'title': None,
                         'members': 0,
                         'is_channel': False,
                         'is_group': False,
@@ -485,40 +515,40 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except FloodWaitError as e:
-            print(f"⚠️ FloodWait ({e.seconds}s) on {url}. Classifying as active and proceeding smoothly.")
-            if e.seconds <= 4 and attempt == 1:
-                await asyncio.sleep(e.seconds + 0.5)
+            # Telegram rate limit
+            wait_s = min(e.seconds, 5)
+            print(f"⚠️ FloodWait ({e.seconds}s) on {url}. Waiting {wait_s}s (attempt {attempt}/{max_retries})...")
+            await asyncio.sleep(wait_s + 0.5)
+            if attempt < max_retries:
                 continue
 
-            # Telegram only rate-limits active invite checks (dead links return InviteHashExpiredError immediately).
-            # Return active immediately to prevent freezing the verification progress.
+            # If all retries exhausted on FloodWait, do NOT assume working! Return expired to protect accuracy.
             res = {
                 'url': url,
-                'status': 'working',
-                'reason': 'Active invite link',
-                'title': 'Telegram Private Chat',
+                'status': 'expired',
+                'reason': 'Rate limit timeout',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False,
                 'definitive': False
             }
-            set_cached_result(url, res)
             return res
 
         except BotMethodInvalidError:
-            # If user client is temporarily unavailable, do not permanently cache expired
-            return {
+            res = {
                 'url': url,
-                'status': 'working',
-                'reason': 'Active Invite',
-                'title': 'Telegram Private Chat',
+                'status': 'expired',
+                'reason': 'Engine disconnected',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False,
                 'definitive': False
             }
+            return res
 
         except RPCError as e:
             err_str = str(e).upper()
@@ -558,7 +588,8 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             # 3. Definite expired/invalid hashes
             if any(k in err_str for k in (
                 "INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "CHAT_INVALID",
-                "CHANNEL_RESTRICTED", "CHAT_RESTRICTED", "CHAT_FORBIDDEN"
+                "CHANNEL_RESTRICTED", "CHAT_RESTRICTED", "CHAT_FORBIDDEN",
+                "PEER_ID_INVALID", "CHANNEL_PRIVATE", "USER_DEACTIVATED"
             )):
                 res = {
                     'url': url,
@@ -574,65 +605,57 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
                 set_cached_result(url, res)
                 return res
 
-            # 4. Rate limit in RPCError
-            if "FLOOD" in err_str or "SLOWMODE" in err_str:
-                await asyncio.sleep(2.0 * attempt)
+            # 4. Flood in RPCError
+            if "FLOOD" in err_str:
+                await asyncio.sleep(1.5 * attempt)
                 if attempt < max_retries:
                     continue
-                return {
-                    'url': url,
-                    'status': 'working',
-                    'reason': 'Active Telegram Invite',
-                    'title': 'Telegram Private Chat',
-                    'members': 0,
-                    'is_channel': True,
-                    'is_group': False,
-                    'request_needed': False,
-                    'definitive': False
-                }
 
             # 5. Other temporary RPC errors
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
-            return {
+            res = {
                 'url': url,
-                'status': 'working',
-                'reason': 'Active Telegram Chat',
-                'title': 'Telegram Private Chat',
+                'status': 'expired',
+                'reason': 'Inaccessible or invalid link',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False,
                 'definitive': False
             }
+            return res
 
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
-            return {
+            res = {
                 'url': url,
-                'status': 'working',
-                'reason': 'Active Telegram Chat',
-                'title': 'Telegram Private Chat',
+                'status': 'expired',
+                'reason': 'Inaccessible or invalid link',
+                'title': None,
                 'members': 0,
-                'is_channel': True,
+                'is_channel': False,
                 'is_group': False,
                 'request_needed': False,
                 'definitive': False
             }
+            return res
 
-    return {
+    res = {
         'url': url,
-        'status': 'working',
-        'reason': 'Active Telegram Chat',
-        'title': 'Telegram Private Chat',
+        'status': 'expired',
+        'reason': 'Inaccessible or invalid link',
+        'title': None,
         'members': 0,
-        'is_channel': True,
+        'is_channel': False,
         'is_group': False,
         'request_needed': False,
         'definitive': False
     }
+    return res
