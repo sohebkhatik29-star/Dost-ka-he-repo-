@@ -664,7 +664,7 @@ async def start_check_callback(event):
 
     for idx, url in enumerate(links, start=1):
         try:
-            res = await asyncio.wait_for(check_single_link(active_client, url), timeout=5.0)
+            res = await asyncio.wait_for(check_single_link(active_client, url), timeout=18.0)
         except asyncio.TimeoutError:
             res = {
                 'url': url,
@@ -710,7 +710,7 @@ async def start_check_callback(event):
             except Exception:
                 pass
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.35)
 
     job['is_running'] = False
     job['results'] = {
