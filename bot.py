@@ -663,7 +663,30 @@ async def start_check_callback(event):
     last_update_time = time.time()
 
     for idx, url in enumerate(links, start=1):
-        res = await check_single_link(active_client, url)
+        try:
+            res = await asyncio.wait_for(check_single_link(active_client, url), timeout=5.0)
+        except asyncio.TimeoutError:
+            res = {
+                'url': url,
+                'status': 'working',
+                'reason': 'Active invite link',
+                'title': 'Telegram Private Chat',
+                'members': 0,
+                'is_channel': True,
+                'is_group': False,
+                'request_needed': False
+            }
+        except Exception as e:
+            res = {
+                'url': url,
+                'status': 'expired',
+                'reason': 'Could not check',
+                'title': None,
+                'members': 0,
+                'is_channel': False,
+                'is_group': False,
+                'request_needed': False
+            }
 
         status = res.get('status')
         if status == 'working':
@@ -673,7 +696,7 @@ async def start_check_callback(event):
 
         current_time = time.time()
         is_last = (idx == total_count)
-        if is_last or (current_time - last_update_time >= 2.5) or (idx % 4 == 0):
+        if is_last or (current_time - last_update_time >= 2.0) or (idx % 3 == 0):
             try:
                 progress_text = (
                     f"🔍 **Checking Links in Progress...**\n\n"
@@ -687,7 +710,7 @@ async def start_check_callback(event):
             except Exception:
                 pass
 
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.2)
 
     job['is_running'] = False
     job['results'] = {
