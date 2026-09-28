@@ -673,9 +673,7 @@ async def start_check_callback(event):
 
         current_time = time.time()
         is_last = (idx == total_count)
-        
-        # 100% BULLETPROOF UI UPDATE: Sirf har 2.5 second me ek baar edit hoga
-        if is_last or (current_time - last_update_time >= 2.5):
+        if is_last or (current_time - last_update_time >= 2.5) or (idx % 4 == 0):
             try:
                 progress_text = (
                     f"🔍 **Checking Links in Progress...**\n\n"
@@ -689,8 +687,7 @@ async def start_check_callback(event):
             except Exception:
                 pass
 
-        # Config.py wala delay lagaya taaki Telegram account par load na pade
-        await asyncio.sleep(CHECK_DELAY)
+        await asyncio.sleep(0.1)
 
     job['is_running'] = False
     job['results'] = {
