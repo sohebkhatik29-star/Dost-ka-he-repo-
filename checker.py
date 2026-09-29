@@ -268,6 +268,7 @@ async def _check_addlist(client: TelegramClient, url: str, slug: str) -> Dict[st
 async def _check_invite(client: TelegramClient, url: str, invite_hash: str) -> Dict[str, Any]:
     result = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
 
+    # ChatInvite = not joined yet, but link is valid/active
     if isinstance(result, types.ChatInvite):
         is_chan = bool(getattr(result, 'channel', False) or getattr(result, 'broadcast', False))
         req = bool(getattr(result, 'request_needed', False))
@@ -279,17 +280,19 @@ async def _check_invite(client: TelegramClient, url: str, invite_hash: str) -> D
             is_channel=is_chan, is_group=not is_chan, request_needed=req,
         )
 
-    # ChatInviteAlready / ChatInvitePeek -> .chat me asli chat hoti he
+    # ChatInviteAlready / ChatInvitePeek → already member or peek available → still WORKING
     chat = getattr(result, 'chat', None)
     if isinstance(chat, types.ChannelForbidden):
+        # Forbidden usually means the account cannot access it (banned / restricted)
         return _res(url, 'expired', 'Channel restricted / inaccessible',
                     clean_title(getattr(chat, 'title', None)), is_channel=True)
 
     is_chan = bool(getattr(chat, 'broadcast', False)) if chat else False
+    title = clean_title(getattr(chat, 'title', None) if chat else None)
+    members = (getattr(chat, 'participants_count', 0) or 0) if chat else 0
     return _res(
-        url, 'working', 'Active invite link',
-        clean_title(getattr(chat, 'title', None) if chat else None),
-        (getattr(chat, 'participants_count', 0) or 0) if chat else 0,
+        url, 'working', 'Active invite link (already joined / accessible)',
+        title, members,
         is_channel=is_chan, is_group=not is_chan,
     )
 
@@ -303,7 +306,7 @@ async def _check_username(client: TelegramClient, url: str, username: str) -> Di
         user = next((u for u in resolved.users if u.id == peer.user_id), None)
         if user is None or getattr(user, 'deleted', False):
             return _res(url, 'expired', 'Account deleted / not found')
-        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or username
+        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or getattr(user, 'username', None) or username
         if getattr(user, 'bot', False):
             return _res(url, 'working', 'Active Telegram Bot', clean_title(name), 1)
         return _res(url, 'working', 'Active user profile', clean_title(name), 1)
@@ -317,21 +320,25 @@ async def _check_username(client: TelegramClient, url: str, username: str) -> Di
             return _res(url, 'expired', 'Channel restricted / inaccessible',
                         clean_title(getattr(chat, 'title', username)), is_channel=True)
         is_chan = bool(getattr(chat, 'broadcast', False))
+        title = clean_title(getattr(chat, 'title', None) or username)
+        members = getattr(chat, 'participants_count', 0) or 0
         return _res(
             url, 'working', 'Active public chat',
-            clean_title(getattr(chat, 'title', username)),
-            getattr(chat, 'participants_count', 0) or 0,
+            title, members,
             is_channel=is_chan, is_group=not is_chan,
         )
 
     return _res(url, 'expired', 'Username not found')
 
 
-async def check_single_link(client: TelegramClient, url: str, max_retries: int = 4) -> Dict[str, Any]:
+async def check_single_link(client: TelegramClient, url: str, max_retries: int = 5) -> Dict[str, Any]:
     """
     Telegram confirm kare link zinda he  -> 'working'
     Telegram confirm kare link dead he   -> 'expired'
     Verify nahi ho paya (network/flood)  -> 'expired' + definitive=False
+
+    Private invite links require a USER session (not bot token).
+    Public usernames / bots work with both user and bot clients.
     """
     cached = get_cached_result(url)
     if cached:
@@ -358,57 +365,72 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             return res
 
         except FloodWaitError as e:
-            if e.seconds > 120:
-                last_reason = f'Rate limited by Telegram ({e.seconds}s) - baad me dobara check karo'
+            wait_s = int(getattr(e, 'seconds', 30) or 30)
+            if wait_s > 180:
+                last_reason = f'Rate limited by Telegram ({wait_s}s) - try again later'
                 break
-            print(f"⚠️ FloodWait {e.seconds}s on {url}, waiting...")
-            await asyncio.sleep(e.seconds + 1)
+            print(f"⚠️ FloodWait {wait_s}s on {url}, waiting...")
+            await asyncio.sleep(wait_s + 2)
             last_reason = 'Rate limited by Telegram'
             continue
 
         except BotMethodInvalidError:
-            last_reason = 'Client bot token se login he - user account (session) chahiye'
+            # Bot token cannot call CheckChatInviteRequest (private invites).
+            # For public/bot links this error is rare; treat as needs user session.
+            if link_type == 'invite' or link_type == 'addlist':
+                last_reason = 'Private link – user session (MTProto engine) required'
+            else:
+                last_reason = 'BotMethodInvalid – try with user session'
             break
 
         except RPCError as e:
             sig = _sig(e)
             if _has(sig, WORKING_CODES):
                 res = _res(url, 'working', 'Active invite link',
-                           request_needed='INVITEREQUESTSENT' in sig)
+                           request_needed=('INVITEREQUESTSENT' in sig))
                 set_cached_result(url, res)
                 return res
             if _has(sig, EXPIRED_CODES):
+                # These are definitive dead/expired/invalid from Telegram itself
                 res = _res(url, 'expired', 'Link expired / invalid / revoked')
                 set_cached_result(url, res)
                 return res
+            # Unknown RPC – retry a few times
             last_reason = f'Telegram error: {type(e).__name__}'
-            await asyncio.sleep(1.5 * attempt)
+            await asyncio.sleep(min(2.0 * attempt, 8))
             continue
 
-        except Exception as e:  # network, timeout, etc.
+        except Exception as e:  # network, timeout, connection reset etc.
             last_reason = f'Could not verify: {type(e).__name__}'
-            await asyncio.sleep(1.5 * attempt)
+            await asyncio.sleep(min(1.8 * attempt, 7))
             continue
 
+    # After all retries still not verified → mark expired but non-definitive
     return _res(url, 'expired', last_reason, definitive=False)
 
 
 async def check_links_sequential(client: TelegramClient, links: List[str],
-                                 delay: float = 1.2) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Har link ek ek karke check. Return: (working_list, not_working_list)"""
+                                 delay: float = 1.5) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Har link ek-ek karke sequentially check karta hai.
+    Returns: (working_list, not_working_list)
+
+    - Temporary failures (network / short FloodWait) pe end me ek baar re-try hota hai.
+    - Sirf Telegram se confirmed dead links + final failures 'expired' mein jaate hain.
+    """
     results: List[Dict[str, Any]] = []
     for url in links:
         results.append(await check_single_link(client, url))
-        await asyncio.sleep(delay)
+        await asyncio.sleep(max(0.8, delay))
 
-    # Jo verify nahi hue the unhe end me ek baar aur try karo
+    # Non-definitive results ko end me ek baar aur try karo (better accuracy)
     for i, r in enumerate(results):
-        if not r['definitive']:
-            await asyncio.sleep(3)
+        if not r.get('definitive', True):
+            await asyncio.sleep(3.5)
             results[i] = await check_single_link(client, r['url'], max_retries=3)
 
-    working = [r for r in results if r['status'] == 'working']
-    not_working = [r for r in results if r['status'] != 'working']
+    working = [r for r in results if r.get('status') == 'working']
+    not_working = [r for r in results if r.get('status') != 'working']
     return working, not_working
 
 

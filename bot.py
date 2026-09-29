@@ -34,7 +34,8 @@ from checker import (
     extract_telegram_links,
     extract_links_from_message,
     check_single_link,
-    parse_link
+    parse_link,
+    check_links_sequential,
 )
 from admin import (
     is_admin,
@@ -650,45 +651,68 @@ async def start_check_callback(event):
             )
 
     job['is_running'] = True
+    # Prefer user client (required for private invites). Public/bot links also work better with it.
     active_client = user_client if is_user_auth else bot_client
 
     await event.edit(
         f"🔄 **Starting Verification...**\n\n"
         f"📊 Total Links: `{total_count}`\n"
-        f"⏳ Validating links safely with MTProto..."
+        f"⏳ Validating links one-by-one with MTProto (safe mode)..."
     )
 
     working_list = []
     expired_list = []
     last_update_time = time.time()
+    # Respect config delay (default 1.5s) so Telegram does not rate-limit and mark good links expired
+    per_link_delay = max(1.0, float(CHECK_DELAY))
 
     for idx, url in enumerate(links, start=1):
+        res = None
         try:
-            res = await asyncio.wait_for(check_single_link(active_client, url), timeout=18.0)
+            # Generous timeout + internal retries inside check_single_link
+            res = await asyncio.wait_for(
+                check_single_link(active_client, url, max_retries=5),
+                timeout=45.0
+            )
         except asyncio.TimeoutError:
             res = {
                 'url': url,
                 'status': 'expired',
-                'reason': 'Timeout / Inaccessible',
+                'reason': 'Timeout / network slow',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False,
             }
         except Exception as e:
             res = {
                 'url': url,
                 'status': 'expired',
-                'reason': 'Could not check',
+                'reason': f'Could not check: {type(e).__name__}',
                 'title': None,
                 'members': 0,
                 'is_channel': False,
                 'is_group': False,
-                'request_needed': False
+                'request_needed': False,
+                'definitive': False,
             }
 
-        status = res.get('status')
+        # If still not definitive, give one extra chance after a short pause
+        if res and not res.get('definitive', True):
+            await asyncio.sleep(2.5)
+            try:
+                res2 = await asyncio.wait_for(
+                    check_single_link(active_client, url, max_retries=3),
+                    timeout=30.0
+                )
+                if res2.get('definitive') or res2.get('status') == 'working':
+                    res = res2
+            except Exception:
+                pass
+
+        status = res.get('status') if res else 'expired'
         if status == 'working':
             working_list.append(res)
         else:
@@ -696,21 +720,22 @@ async def start_check_callback(event):
 
         current_time = time.time()
         is_last = (idx == total_count)
-        if is_last or (current_time - last_update_time >= 2.0) or (idx % 3 == 0):
+        if is_last or (current_time - last_update_time >= 2.5) or (idx % 2 == 0):
             try:
                 progress_text = (
                     f"🔍 **Checking Links in Progress...**\n\n"
-                    f"**Progress:** `{idx} / {total_count}` (`{int((idx/total_count)*100)}%`)\n\n"
+                    f"**Progress:** `{idx} / {total_count}` (`{int((idx / total_count) * 100)}%`)\n\n"
                     f"✅ **Working:** `{len(working_list)}`\n"
-                    f"❌ **Expired / Invalid:** `{len(expired_list)}`\n\n"
-                    f"⏳ *Please wait while MTProto validates links safely...*"
+                    f"❌ **Not Working / Expired:** `{len(expired_list)}`\n\n"
+                    f"⏳ *Har link ek-ek karke safely check ho raha hai...*"
                 )
                 await event.edit(progress_text)
                 last_update_time = current_time
             except Exception:
                 pass
 
-        await asyncio.sleep(0.35)
+        # Critical: proper delay prevents FloodWait that was causing false "expired"
+        await asyncio.sleep(per_link_delay)
 
     job['is_running'] = False
     job['results'] = {
@@ -732,7 +757,7 @@ async def start_check_callback(event):
         "📊 **Statistics:**\n"
         f"• **Total Links:** `{total_count}`\n"
         f"• ✅ **Working Links:** `{len(working_list)}` ({working_pct:.1f}%)\n"
-        f"• ❌ **Expired / Invalid:** `{len(expired_list)}` ({expired_pct:.1f}%)\n\n"
+        f"• ❌ **Not Working / Expired:** `{len(expired_list)}` ({expired_pct:.1f}%)\n\n"
         "**Choose how to receive working links:**"
     )
 
