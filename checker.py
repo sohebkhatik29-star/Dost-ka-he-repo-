@@ -248,19 +248,19 @@ def _has(sig: str, codes: Tuple[str, ...]) -> bool:
     return any(c.replace('_', '') in sig for c in codes)
 
 
-# Only definitive "dead" errors from Telegram. Do NOT put account-restriction
-# errors (CHANNEL_PRIVATE etc.) here — those often mean the link is still
-# valid for other users and were causing false "expired" results.
+# ONLY these mean the link is truly dead (Telegram itself said hash/slug is bad).
+# Never put account-side / restriction errors here.
 EXPIRED_CODES = (
     'INVITE_HASH_EXPIRED', 'INVITE_HASH_INVALID', 'INVITE_HASH_EMPTY',
     'INVITE_SLUG_EXPIRED', 'INVITE_SLUG_EMPTY', 'INVITE_SLUG_INVALID',
     'CHATLIST_INVALID', 'USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED',
     'CHANNEL_INVALID', 'CHAT_INVALID',
 )
-# These mean the link is still usable (or the account is restricted, but link lives)
+# Account-side or "already related" errors — the LINK itself is still valid for others.
 WORKING_CODES = (
     'INVITE_REQUEST_SENT', 'USER_ALREADY_PARTICIPANT', 'USER_BANNED_IN_CHANNEL',
-    'CHANNEL_PRIVATE',  # account cannot see content, but invite/username can still be valid
+    'CHANNEL_PRIVATE', 'CHAT_WRITE_FORBIDDEN', 'USER_NOT_PARTICIPANT',
+    'CHANNELS_TOO_MUCH', 'USERS_TOO_MUCH', 'USER_CHANNELS_TOO_MUCH',
 )
 
 
@@ -360,7 +360,7 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
     """
     Telegram confirm kare link zinda he  -> 'working'
     Telegram confirm kare link dead he   -> 'expired'
-    Verify nahi ho paya (network/flood)  -> 'expired' + definitive=False
+    Verify nahi ho paya (network/flood)  -> for invites: still 'working' (not confirmed dead)
 
     Private invite links require a USER session (not bot token).
     Public usernames / bots work with both user and bot clients.
@@ -401,7 +401,6 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
 
         except BotMethodInvalidError:
             # Bot token cannot call CheckChatInviteRequest (private invites).
-            # For public/bot links this error is rare; treat as needs user session.
             if link_type == 'invite' or link_type == 'addlist':
                 last_reason = 'Private link – user session (MTProto engine) required'
             else:
@@ -410,17 +409,26 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
 
         except RPCError as e:
             sig = _sig(e)
+            # 1) Explicit dead from Telegram
+            if _has(sig, EXPIRED_CODES):
+                res = _res(url, 'expired', 'Link expired / invalid / revoked')
+                set_cached_result(url, res)
+                return res
+            # 2) Account-side errors → link is still valid for other users
             if _has(sig, WORKING_CODES):
                 res = _res(url, 'working', 'Active invite link',
                            request_needed=('INVITEREQUESTSENT' in sig))
                 set_cached_result(url, res)
                 return res
-            if _has(sig, EXPIRED_CODES):
-                # These are definitive dead/expired/invalid from Telegram itself
-                res = _res(url, 'expired', 'Link expired / invalid / revoked')
+            # 3) Unknown RPC on private invite: do NOT mark expired.
+            #    Only Telegram's explicit hash-expired errors mean dead.
+            #    Rate-limit / restriction / flood on checker account ≠ dead link.
+            if link_type in ('invite', 'addlist'):
+                print(f"ℹ️ Invite RPC {type(e).__name__} on {url} → treat as WORKING (not confirmed dead)")
+                res = _res(url, 'working', f'Active invite (checker: {type(e).__name__})')
                 set_cached_result(url, res)
                 return res
-            # Unknown RPC – retry a few times
+            # Public/bot unknown RPC – retry
             last_reason = f'Telegram error: {type(e).__name__}'
             await asyncio.sleep(min(2.0 * attempt, 8))
             continue
@@ -430,7 +438,10 @@ async def check_single_link(client: TelegramClient, url: str, max_retries: int =
             await asyncio.sleep(min(1.8 * attempt, 7))
             continue
 
-    # After all retries still not verified → mark expired but non-definitive
+    # After all retries still not verified:
+    # For private invites — never guess "expired". Only explicit EXPIRED_CODES mean dead.
+    if link_type in ('invite', 'addlist'):
+        return _res(url, 'working', last_reason or 'Active invite (unconfirmed dead)', definitive=False)
     return _res(url, 'expired', last_reason, definitive=False)
 
 
