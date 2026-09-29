@@ -69,7 +69,7 @@ def extract_telegram_links(text: str) -> List[str]:
             seen.add(canonical)
             found_links.append(canonical)
 
-    tg_domains = re.findall(r'tg://resolve\?domain=([a-zA-Z0-9_]{4,32})(?:&start=([^\s\n\(\)\[\]\{\}<>"\',;]+))?', text, re.IGNORECASE)
+    tg_domains = re.findall(r'tg://resolve\?domain=([a-zA-Z0-9_]{4,32})(?:&start=([^\s\n\(\)\[\]\{\}<>\"\',;]+))?', text, re.IGNORECASE)
     for d, st in tg_domains:
         if d.lower() not in IGNORED_SYSTEM_PATHS and not d.isdigit():
             canonical = f"https://t.me/{d}" + (f"?start={st}" if st else "")
@@ -87,12 +87,12 @@ def extract_telegram_links(text: str) -> List[str]:
 
     # 3. Regex search for standard URLs
     url_pattern = re.compile(
-        r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/([^\s\n\(\)\[\]\{\}<>"\',;]+)',
+        r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.(?:me|dog)|telegram\.org)/([^\s\n\(\)\[\]\{\}<>\"\',;]+)',
         re.IGNORECASE
     )
 
     for match in url_pattern.finditer(text):
-        raw_full = match.group(1).strip().rstrip('.,;:!?"\')]}')
+        raw_full = match.group(1).strip().rstrip('.,;:!?\"\')]}')
         if not raw_full:
             continue
 
@@ -248,13 +248,20 @@ def _has(sig: str, codes: Tuple[str, ...]) -> bool:
     return any(c.replace('_', '') in sig for c in codes)
 
 
+# Only definitive "dead" errors from Telegram. Do NOT put account-restriction
+# errors (CHANNEL_PRIVATE etc.) here — those often mean the link is still
+# valid for other users and were causing false "expired" results.
 EXPIRED_CODES = (
     'INVITE_HASH_EXPIRED', 'INVITE_HASH_INVALID', 'INVITE_HASH_EMPTY',
     'INVITE_SLUG_EXPIRED', 'INVITE_SLUG_EMPTY', 'INVITE_SLUG_INVALID',
     'CHATLIST_INVALID', 'USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED',
-    'CHANNEL_PRIVATE', 'CHANNEL_INVALID', 'CHAT_INVALID',
+    'CHANNEL_INVALID', 'CHAT_INVALID',
 )
-WORKING_CODES = ('INVITE_REQUEST_SENT', 'USER_ALREADY_PARTICIPANT', 'USER_BANNED_IN_CHANNEL')
+# These mean the link is still usable (or the account is restricted, but link lives)
+WORKING_CODES = (
+    'INVITE_REQUEST_SENT', 'USER_ALREADY_PARTICIPANT', 'USER_BANNED_IN_CHANNEL',
+    'CHANNEL_PRIVATE',  # account cannot see content, but invite/username can still be valid
+)
 
 
 async def _check_addlist(client: TelegramClient, url: str, slug: str) -> Dict[str, Any]:
@@ -281,17 +288,29 @@ async def _check_invite(client: TelegramClient, url: str, invite_hash: str) -> D
         )
 
     # ChatInviteAlready / ChatInvitePeek → already member or peek available → still WORKING
+    # IMPORTANT FIX: Even if chat is ChannelForbidden (this account is banned/restricted),
+    # the INVITE LINK itself is still valid for other users. Do NOT mark it expired.
+    # False "expired" on active links was happening because of this.
     chat = getattr(result, 'chat', None)
-    if isinstance(chat, types.ChannelForbidden):
-        # Forbidden usually means the account cannot access it (banned / restricted)
-        return _res(url, 'expired', 'Channel restricted / inaccessible',
-                    clean_title(getattr(chat, 'title', None)), is_channel=True)
+    is_chan = True
+    title = 'Telegram Private Chat'
+    members = 0
+    if chat is not None:
+        title = clean_title(getattr(chat, 'title', None) or 'Telegram Private Chat')
+        if isinstance(chat, types.ChannelForbidden):
+            is_chan = True
+            # Link is valid; only this checker account cannot access the content
+        else:
+            is_chan = bool(getattr(chat, 'broadcast', False))
+            members = getattr(chat, 'participants_count', 0) or 0
 
-    is_chan = bool(getattr(chat, 'broadcast', False)) if chat else False
-    title = clean_title(getattr(chat, 'title', None) if chat else None)
-    members = (getattr(chat, 'participants_count', 0) or 0) if chat else 0
+    reason = (
+        'Active invite link (account restricted, but link valid)'
+        if isinstance(chat, types.ChannelForbidden)
+        else 'Active invite link (already joined / accessible)'
+    )
     return _res(
-        url, 'working', 'Active invite link (already joined / accessible)',
+        url, 'working', reason,
         title, members,
         is_channel=is_chan, is_group=not is_chan,
     )
@@ -316,14 +335,20 @@ async def _check_username(client: TelegramClient, url: str, username: str) -> Di
         chat = next((c for c in resolved.chats if c.id == pid), None)
         if chat is None:
             return _res(url, 'expired', 'Chat not found')
-        if isinstance(chat, types.ChannelForbidden):
-            return _res(url, 'expired', 'Channel restricted / inaccessible',
-                        clean_title(getattr(chat, 'title', username)), is_channel=True)
-        is_chan = bool(getattr(chat, 'broadcast', False))
+        # FIX: ChannelForbidden means THIS account cannot access content,
+        # but the public username / link still exists and is valid for others.
+        # Do not mark active public links as expired.
+        is_chan = True
         title = clean_title(getattr(chat, 'title', None) or username)
-        members = getattr(chat, 'participants_count', 0) or 0
+        members = 0
+        if isinstance(chat, types.ChannelForbidden):
+            reason = 'Active public chat (account restricted, but link valid)'
+        else:
+            is_chan = bool(getattr(chat, 'broadcast', False))
+            members = getattr(chat, 'participants_count', 0) or 0
+            reason = 'Active public chat'
         return _res(
-            url, 'working', 'Active public chat',
+            url, 'working', reason,
             title, members,
             is_channel=is_chan, is_group=not is_chan,
         )
